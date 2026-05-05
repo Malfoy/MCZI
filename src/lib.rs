@@ -4041,6 +4041,558 @@ mod tests {
         })
     }
 
+    fn reverse_complemented(seq: &[u8]) -> Vec<u8> {
+        let mut rc = seq.to_vec();
+        reverse_complement_in_place(&mut rc);
+        rc
+    }
+
+    fn canonical_encoded(seq: &[u8]) -> EncodedKmer {
+        encode(seq).min(encode(&reverse_complemented(seq)))
+    }
+
+    fn sorted_counts(map: AHashMap<EncodedKmer, Count>) -> Vec<(EncodedKmer, Count)> {
+        let mut records = map.into_iter().collect::<Vec<_>>();
+        records.sort_unstable();
+        records
+    }
+
+    fn assert_ascii_counts(seq: &[u8], k: usize, expected: &[(&[u8], Count)]) {
+        let mut actual = AHashMap::new();
+        add_superkmer_kmer_counts(
+            seq,
+            CounterConfig {
+                k,
+                minimizer: 1,
+                threshold: 0,
+            },
+            &mut actual,
+        );
+        let mut expected = expected
+            .iter()
+            .map(|&(kmer, count)| (canonical_encoded(kmer), count))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(sorted_counts(actual), expected);
+    }
+
+    fn assert_packed_roundtrip(seq: &[u8]) {
+        let mut packed = Vec::new();
+        append_packed_dna_seq(&mut packed, seq);
+        assert_eq!(packed.len(), packed_dna_bytes(seq.len()));
+        for (idx, &base) in seq.iter().enumerate() {
+            assert_eq!(packed_base_bits(&packed, idx), base_bits(base));
+        }
+    }
+
+    fn assert_packed_u64_counts(seq: &[u8], k: usize) {
+        let config = CounterConfig {
+            k,
+            minimizer: 1,
+            threshold: 0,
+        };
+        let mut packed = Vec::new();
+        append_packed_dna_seq(&mut packed, seq);
+
+        let mut ascii_counts = AHashMap::new();
+        add_superkmer_kmer_counts(seq, config, &mut ascii_counts);
+
+        let mut packed_kmers = Vec::new();
+        append_packed_superkmer_kmers_u64(&packed, seq.len(), config, &mut packed_kmers);
+        let mut packed_counts = AHashMap::new();
+        for encoded in packed_kmers {
+            add_count(&mut packed_counts, encoded as EncodedKmer, 1);
+        }
+
+        assert_eq!(sorted_counts(packed_counts), sorted_counts(ascii_counts));
+    }
+
+    fn assert_minimizer_runs_cover(seq: &[u8], k: usize, m: usize, order: MinimizerOrder) {
+        let config = CounterConfig {
+            k,
+            minimizer: m,
+            threshold: 0,
+        };
+        let total_windows = seq.len().saturating_sub(k) + usize::from(seq.len() >= k);
+        let mut ranges = Vec::new();
+        let mut buffers = MinimizerRunBuffers::default();
+        for_each_minimizer_run_on_seq(
+            AsciiSeq(seq),
+            config,
+            order,
+            &mut buffers,
+            |_, start, end| {
+                ranges.push((start, end));
+            },
+        );
+
+        if total_windows == 0 {
+            assert!(ranges.is_empty());
+            return;
+        }
+
+        let mut cursor = 0;
+        for (start, end) in ranges {
+            assert_eq!(start, cursor);
+            assert!(end > start);
+            assert!(end <= total_windows);
+            cursor = end;
+        }
+        assert_eq!(cursor, total_windows);
+    }
+
+    fn assert_simplitig_chain(k: usize, kmers: &[&[u8]], expected: &[u8]) {
+        let mut records = kmers
+            .iter()
+            .map(|kmer| CountedKmer {
+                encoded: canonical_encoded(kmer),
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| record.encoded);
+
+        let simplitigs = simplitig_sequences(&records, k).unwrap();
+        let rc_expected = reverse_complemented(expected);
+        assert!(
+            simplitigs
+                .iter()
+                .any(|seq| seq == expected || seq == &rc_expected)
+        );
+        let represented = simplitigs
+            .iter()
+            .map(|seq| seq.len().saturating_sub(k) + usize::from(seq.len() >= k))
+            .sum::<usize>();
+        assert_eq!(represented, records.len());
+    }
+
+    fn assert_validation_result(config: CounterConfig, dataset_mode: bool, should_pass: bool) {
+        let result = if dataset_mode {
+            validate_dataset_presence_config(config)
+        } else {
+            validate_config(config)
+        };
+        assert_eq!(result.is_ok(), should_pass, "{config:?}");
+    }
+
+    macro_rules! decode_case {
+        ($name:ident, $seq:expr) => {
+            #[test]
+            fn $name() {
+                let seq = $seq;
+                assert_eq!(decode_kmer(encode(seq), seq.len()), seq);
+            }
+        };
+    }
+
+    macro_rules! mask_case {
+        ($name:ident, $k:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(kmer_mask($k), $expected);
+            }
+        };
+    }
+
+    macro_rules! packed_roundtrip_case {
+        ($name:ident, $seq:expr) => {
+            #[test]
+            fn $name() {
+                assert_packed_roundtrip($seq);
+            }
+        };
+    }
+
+    macro_rules! ascii_count_case {
+        ($name:ident, $seq:expr, $k:expr, [$(($kmer:expr, $count:expr)),+ $(,)?]) => {
+            #[test]
+            fn $name() {
+                assert_ascii_counts($seq, $k, &[$(($kmer, $count)),+]);
+            }
+        };
+    }
+
+    macro_rules! packed_u64_count_case {
+        ($name:ident, $seq:expr, $k:expr) => {
+            #[test]
+            fn $name() {
+                assert_packed_u64_counts($seq, $k);
+            }
+        };
+    }
+
+    macro_rules! minimizer_coverage_case {
+        ($name:ident, $seq:expr, $k:expr, $m:expr, $order:expr) => {
+            #[test]
+            fn $name() {
+                assert_minimizer_runs_cover($seq, $k, $m, $order);
+            }
+        };
+    }
+
+    macro_rules! simplitig_case {
+        ($name:ident, $k:expr, [$($kmer:expr),+ $(,)?], $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_simplitig_chain($k, &[$($kmer),+], $expected);
+            }
+        };
+    }
+
+    macro_rules! validation_case {
+        ($name:ident, $config:expr, $dataset_mode:expr, $should_pass:expr) => {
+            #[test]
+            fn $name() {
+                assert_validation_result($config, $dataset_mode, $should_pass);
+            }
+        };
+    }
+
+    decode_case!(decode_case_single_a, b"A");
+    decode_case!(decode_case_single_c, b"C");
+    decode_case!(decode_case_single_g, b"G");
+    decode_case!(decode_case_single_t, b"T");
+    decode_case!(decode_case_ac, b"AC");
+    decode_case!(decode_case_gt, b"GT");
+    decode_case!(decode_case_acg, b"ACG");
+    decode_case!(decode_case_tga, b"TGA");
+    decode_case!(decode_case_acgt, b"ACGT");
+    decode_case!(decode_case_ttaa, b"TTAA");
+    decode_case!(decode_case_aaacg, b"AAACG");
+    decode_case!(decode_case_gattaca, b"GATTACA");
+    decode_case!(decode_case_acgtacgt, b"ACGTACGT");
+    decode_case!(decode_case_ttttcccc, b"TTTTCCCC");
+    decode_case!(decode_case_acacacacac, b"ACACACACAC");
+    decode_case!(decode_case_long_acgt, b"ACGTACGTACGTACGT");
+
+    mask_case!(mask_case_k1, 1, 0b11);
+    mask_case!(mask_case_k2, 2, 0b1111);
+    mask_case!(mask_case_k3, 3, 0b11_1111);
+    mask_case!(mask_case_k4, 4, 0xff);
+    mask_case!(mask_case_k8, 8, (1u128 << 16) - 1);
+    mask_case!(mask_case_k16, 16, (1u128 << 32) - 1);
+    mask_case!(mask_case_k32, 32, (1u128 << 64) - 1);
+    mask_case!(mask_case_k64, 64, u128::MAX);
+
+    packed_roundtrip_case!(packed_roundtrip_single_base, b"A");
+    packed_roundtrip_case!(packed_roundtrip_two_bases, b"AC");
+    packed_roundtrip_case!(packed_roundtrip_three_bases, b"ACG");
+    packed_roundtrip_case!(packed_roundtrip_four_bases, b"ACGT");
+    packed_roundtrip_case!(packed_roundtrip_five_bases, b"ACGTA");
+    packed_roundtrip_case!(packed_roundtrip_homopolymer, b"TTTTT");
+    packed_roundtrip_case!(packed_roundtrip_mixed_short, b"CAAAGG");
+    packed_roundtrip_case!(packed_roundtrip_gattaca, b"GATTACA");
+    packed_roundtrip_case!(packed_roundtrip_alternating_a, b"ACACACACA");
+    packed_roundtrip_case!(packed_roundtrip_alternating_b, b"TGCATGCATG");
+    packed_roundtrip_case!(packed_roundtrip_all_blocks, b"AAAACCCCGGGGTTTT");
+    packed_roundtrip_case!(packed_roundtrip_uneven_blocks, b"CCGTAAGTCCGA");
+    packed_roundtrip_case!(packed_roundtrip_three_agt, b"AGT");
+    packed_roundtrip_case!(packed_roundtrip_ten_bases, b"TTAACCGGTA");
+    packed_roundtrip_case!(packed_roundtrip_twelve_bases, b"GGGAAATTTCCC");
+    packed_roundtrip_case!(packed_roundtrip_fifteen_bases, b"ACGTACGTACGTACG");
+
+    ascii_count_case!(ascii_counts_aaaa_k3, b"AAAA", 3, [(b"AAA", 2)]);
+    ascii_count_case!(ascii_counts_tttt_k3, b"TTTT", 3, [(b"AAA", 2)]);
+    ascii_count_case!(ascii_counts_aaac_k3, b"AAAC", 3, [(b"AAA", 1), (b"AAC", 1)]);
+    ascii_count_case!(ascii_counts_gttt_k3, b"GTTT", 3, [(b"AAA", 1), (b"AAC", 1)]);
+    ascii_count_case!(ascii_counts_acgt_k3, b"ACGT", 3, [(b"ACG", 2)]);
+    ascii_count_case!(
+        ascii_counts_acgta_k3,
+        b"ACGTA",
+        3,
+        [(b"ACG", 2), (b"GTA", 1)]
+    );
+    ascii_count_case!(
+        ascii_counts_tacgt_k3,
+        b"TACGT",
+        3,
+        [(b"ACG", 2), (b"GTA", 1)]
+    );
+    ascii_count_case!(ascii_counts_ccccc_k3, b"CCCCC", 3, [(b"CCC", 3)]);
+    ascii_count_case!(ascii_counts_ggggg_k3, b"GGGGG", 3, [(b"CCC", 3)]);
+    ascii_count_case!(
+        ascii_counts_aaacg_k3,
+        b"AAACG",
+        3,
+        [(b"AAA", 1), (b"AAC", 1), (b"ACG", 1)]
+    );
+    ascii_count_case!(
+        ascii_counts_cgttt_k3,
+        b"CGTTT",
+        3,
+        [(b"AAA", 1), (b"AAC", 1), (b"ACG", 1)]
+    );
+    ascii_count_case!(ascii_counts_atatat_k3, b"ATATAT", 3, [(b"ATA", 4)]);
+    ascii_count_case!(ascii_counts_agct_k3, b"AGCT", 3, [(b"AGC", 2)]);
+    ascii_count_case!(ascii_counts_aaaaa_k4, b"AAAAA", 4, [(b"AAAA", 2)]);
+    ascii_count_case!(
+        ascii_counts_acgtac_k4,
+        b"ACGTAC",
+        4,
+        [(b"ACGT", 1), (b"CGTA", 1), (b"GTAC", 1)]
+    );
+    ascii_count_case!(
+        ascii_counts_aaaaccc_k4,
+        b"AAAACCC",
+        4,
+        [(b"AAAA", 1), (b"AAAC", 1), (b"AACC", 1), (b"ACCC", 1)]
+    );
+
+    packed_u64_count_case!(packed_u64_counts_aaaa_k3, b"AAAA", 3);
+    packed_u64_count_case!(packed_u64_counts_tttt_k3, b"TTTT", 3);
+    packed_u64_count_case!(packed_u64_counts_aaac_k3, b"AAAC", 3);
+    packed_u64_count_case!(packed_u64_counts_gttt_k3, b"GTTT", 3);
+    packed_u64_count_case!(packed_u64_counts_acgt_k3, b"ACGT", 3);
+    packed_u64_count_case!(packed_u64_counts_acgta_k3, b"ACGTA", 3);
+    packed_u64_count_case!(packed_u64_counts_tacgt_k3, b"TACGT", 3);
+    packed_u64_count_case!(packed_u64_counts_ccccc_k3, b"CCCCC", 3);
+    packed_u64_count_case!(packed_u64_counts_ggggg_k3, b"GGGGG", 3);
+    packed_u64_count_case!(packed_u64_counts_aaacg_k3, b"AAACG", 3);
+    packed_u64_count_case!(packed_u64_counts_cgttt_k3, b"CGTTT", 3);
+    packed_u64_count_case!(packed_u64_counts_atatat_k3, b"ATATAT", 3);
+    packed_u64_count_case!(packed_u64_counts_agct_k3, b"AGCT", 3);
+    packed_u64_count_case!(packed_u64_counts_aaaaa_k4, b"AAAAA", 4);
+    packed_u64_count_case!(packed_u64_counts_acgtac_k4, b"ACGTAC", 4);
+    packed_u64_count_case!(packed_u64_counts_aaaaccc_k4, b"AAAACCC", 4);
+
+    minimizer_coverage_case!(
+        minimizer_cover_direct_acgt,
+        b"ACGTACGT",
+        3,
+        2,
+        MinimizerOrder::SimdDirectHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_value_acgt,
+        b"ACGTACGT",
+        3,
+        2,
+        MinimizerOrder::SimdValueHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_antilex_acgt,
+        b"ACGTACGT",
+        3,
+        2,
+        MinimizerOrder::AntiLex
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_direct_homopolymer,
+        b"AAAAAAA",
+        5,
+        3,
+        MinimizerOrder::SimdDirectHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_value_homopolymer,
+        b"AAAAAAA",
+        5,
+        3,
+        MinimizerOrder::SimdValueHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_antilex_homopolymer,
+        b"AAAAAAA",
+        5,
+        3,
+        MinimizerOrder::AntiLex
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_direct_mixed,
+        b"GATTACAGATTACA",
+        5,
+        3,
+        MinimizerOrder::SimdDirectHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_value_mixed,
+        b"GATTACAGATTACA",
+        5,
+        3,
+        MinimizerOrder::SimdValueHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_antilex_mixed,
+        b"GATTACAGATTACA",
+        5,
+        3,
+        MinimizerOrder::AntiLex
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_direct_longer_m,
+        b"AAACCCGGGTTTAAACCC",
+        7,
+        5,
+        MinimizerOrder::SimdDirectHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_value_longer_m,
+        b"AAACCCGGGTTTAAACCC",
+        7,
+        5,
+        MinimizerOrder::SimdValueHash
+    );
+    minimizer_coverage_case!(
+        minimizer_cover_antilex_longer_m,
+        b"AAACCCGGGTTTAAACCC",
+        7,
+        5,
+        MinimizerOrder::AntiLex
+    );
+
+    simplitig_case!(simplitig_single_k3, 3, [b"AAA"], b"AAA");
+    simplitig_case!(simplitig_two_k3, 3, [b"AAA", b"AAC"], b"AAAC");
+    simplitig_case!(simplitig_three_k3, 3, [b"AAA", b"AAC", b"ACG"], b"AAACG");
+    simplitig_case!(simplitig_atg_k3, 3, [b"AAA", b"AAT", b"ATG"], b"AAATG");
+    simplitig_case!(simplitig_acca_k3, 3, [b"AAC", b"ACC", b"CCA"], b"AACCA");
+    simplitig_case!(simplitig_acg_k4, 4, [b"AAAA", b"AAAC", b"AACG"], b"AAAACG");
+    simplitig_case!(simplitig_atg_k4, 4, [b"AAAA", b"AAAT", b"AATG"], b"AAAATG");
+    simplitig_case!(simplitig_accg_k4, 4, [b"AAAC", b"AACC", b"ACCG"], b"AAACCG");
+    simplitig_case!(
+        simplitig_actaa_k4,
+        4,
+        [b"AACT", b"ACTA", b"CTAA"],
+        b"AACTAA"
+    );
+    simplitig_case!(
+        simplitig_acg_k5,
+        5,
+        [b"AAAAA", b"AAAAC", b"AAACG"],
+        b"AAAAACG"
+    );
+    simplitig_case!(
+        simplitig_atga_k5,
+        5,
+        [b"AAAAT", b"AAATG", b"AATGA"],
+        b"AAAATGA"
+    );
+    simplitig_case!(
+        simplitig_ccgta_k5,
+        5,
+        [b"AACCG", b"ACCGT", b"CCGTA"],
+        b"AACCGTA"
+    );
+
+    validation_case!(
+        validation_accepts_minimal_normal_config,
+        CounterConfig {
+            k: 1,
+            minimizer: 1,
+            threshold: 0,
+        },
+        false,
+        true
+    );
+    validation_case!(
+        validation_accepts_maximal_normal_config,
+        CounterConfig {
+            k: 64,
+            minimizer: 64,
+            threshold: 254,
+        },
+        false,
+        true
+    );
+    validation_case!(
+        validation_rejects_zero_k,
+        CounterConfig {
+            k: 0,
+            minimizer: 1,
+            threshold: 0,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_k_above_64,
+        CounterConfig {
+            k: 65,
+            minimizer: 1,
+            threshold: 0,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_zero_minimizer,
+        CounterConfig {
+            k: 3,
+            minimizer: 0,
+            threshold: 0,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_minimizer_above_k,
+        CounterConfig {
+            k: 3,
+            minimizer: 4,
+            threshold: 0,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_minimizer_above_64,
+        CounterConfig {
+            k: 64,
+            minimizer: 65,
+            threshold: 0,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_threshold_255,
+        CounterConfig {
+            k: 3,
+            minimizer: 2,
+            threshold: 255,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_rejects_large_normal_threshold,
+        CounterConfig {
+            k: 3,
+            minimizer: 2,
+            threshold: 1000,
+        },
+        false,
+        false
+    );
+    validation_case!(
+        validation_accepts_high_dataset_threshold,
+        CounterConfig {
+            k: 32,
+            minimizer: 21,
+            threshold: 300,
+        },
+        true,
+        true
+    );
+    validation_case!(
+        validation_rejects_dataset_k_above_32,
+        CounterConfig {
+            k: 33,
+            minimizer: 21,
+            threshold: 1,
+        },
+        true,
+        false
+    );
+    validation_case!(
+        validation_rejects_dataset_threshold_mask,
+        CounterConfig {
+            k: 31,
+            minimizer: 21,
+            threshold: DATASET_PRESENCE_COUNT_MASK as Count,
+        },
+        true,
+        false
+    );
+
     #[test]
     fn decode_round_trips_acgt_encoding() {
         let seq = b"ACGTACGT";

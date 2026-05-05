@@ -9,22 +9,11 @@ It currently builds three user-facing binaries:
 
 The implementation is reverse-complement aware everywhere k-mers are encoded or queried. Output FASTA is written as simplitigs, not one FASTA record per k-mer.
 
-## Status
-
-This repository is prepared for publication at:
-
-```bash
-https://github.com/Malfoy/MCZI
-```
-
-No push is required to use the code locally. Generated benchmark data, build output, perf files, and the local KMC checkout are ignored by git.
-
 ## Requirements
 
 - Rust toolchain with edition 2024 support. Rust 1.85 or newer is recommended.
 - A C/C++ build toolchain for native transitive dependencies.
 - `pkg-config` is useful on Linux.
-- Optional command-line tools for inspection and benchmarking: `gzip`, `xz`, `zstd`, `/usr/bin/time`, `pidstat`, and `perf`.
 
 On Debian/Ubuntu-like systems:
 
@@ -56,16 +45,6 @@ For development builds:
 
 ```bash
 cargo build --bin MC --bin ZI --bin MCZI
-```
-
-For the benchmark/helper binaries:
-
-```bash
-cargo build --release \
-  --bin mc-minimizer-scan \
-  --bin mc-minimizer-count \
-  --bin mc-phase12 \
-  --bin simulate-reads-from-genome
 ```
 
 ## Supported Input And Output Compression
@@ -270,40 +249,6 @@ MCZI constraints:
 - `m` must be greater than 0 and less than `k`.
 - `m` is used both for MC minimizer processing and for SSHash construction.
 
-## Phase Timing
-
-The tools print phase timing to stderr as tab-separated records:
-
-```text
-MC_PHASE    phase_name    seconds
-```
-
-Examples:
-
-- MC normal mode: `1_minimizer_counting`, `2_superkmer_partitioning`, `3_kmer_counting_and_output`, `total`
-- MC FOFN mode: `1_dataset_minimizer_counting`, `2_dataset_kmer_counting`, `3_output_streaming`, `total`
-- ZI: `1_sshash_indexing`, `2_query_subtraction`, `3_simplitig_output`, `total`
-- MCZI: `1_mc_index_counting`, `2_mc_index_simplitigs`, `3_sshash_indexing`, `4_query_subtraction`, `5_simplitig_output`, `total`
-
-MC also prints selected statistics such as partition bytes:
-
-```text
-MC_STAT     partition_bytes     bytes
-```
-
-## Useful Environment Variables
-
-MC exposes a few tuning variables for experiments:
-
-- `MC_MINIMIZER_ORDER=direct`: default. Uses `simd-minimizers` selected minimizer hashes directly.
-- `MC_MINIMIZER_ORDER=antilex`: uses anti-lexicographic minimizer ordering through `simd-minimizers`.
-- `MC_MINIMIZER_ORDER=simd-value`: extracts selected minimizer sequence values and hashes them in MC.
-- `MC_KMC_STYLE=0`: disables KMC-style filtered super-kmer partitioning for the KFF abundance path.
-- `MC_PHASE3_BUCKET_BITS=N`: bucket phase 3 partition processing. Current accepted range is `0..=10`.
-- `MC_PHASE3_THREADS=N`: override the Rayon thread count used for phase 3 partition processing.
-
-The production minimizer implementation is based on `simd-minimizers`; MC does not depend on ntHash.
-
 ## Under The Hood
 
 ### MC Normal Abundance Mode
@@ -379,29 +324,16 @@ Run all tests:
 cargo test
 ```
 
-At this revision, `cargo test` runs 12 tests total:
+At this revision, `cargo test` runs 120 tests total:
 
-- 10 library tests
+- 118 library tests
 - 1 `ZI` binary test
 - 1 `MCZI` binary test
 
-The tests cover canonical counting, gzip/xz input, compressed FASTA output, FOFN dataset-presence behavior, simplitig compaction, KFF writing, ZI subtraction, and MCZI subtraction.
+The tests cover canonical encoding, packed DNA helpers, minimizer run coverage, normal abundance counting, gzip/xz input, compressed FASTA output, FOFN dataset-presence behavior, validation errors, simplitig compaction, KFF writing, ZI subtraction, and MCZI subtraction.
 
 Format check:
 
 ```bash
 cargo fmt --check
 ```
-
-## Benchmark Helpers
-
-The repository has helper binaries and shell scripts under `bench/` for local performance work:
-
-- `simulate-reads-from-genome`: simulate long reads from a genome.
-- `mc-minimizer-scan`: benchmark parsing plus minimizer scanning.
-- `mc-minimizer-count`: benchmark phase 1 minimizer counting.
-- `mc-phase12`: benchmark minimizer counting plus filtered super-kmer partitioning.
-- `bench/run_mc_time_pidstat.sh`: run MC with wall-clock, CPU, RSS, and pidstat collection.
-- `bench/run_kmc_time_pidstat.sh`: run KMC with comparable timing collection.
-
-Large generated benchmark directories should stay under `bench_runs/`, which is ignored by git.
