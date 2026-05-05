@@ -1,0 +1,28 @@
+/target/
+/bench_runs/
+/perf.data
+/perf.data.*
+/*.perf.data
+/tools/KMC/
+/bench/simulate_long_reads
+
+# Temporary partition/index directories created by MC, ZI, and MCZI.
+/mc-partitions-*/
+/zi-sshash-*/
+/mczi-sshash-*/
+
+# Temporary intermediate files from MC partitioning/output.
+*.skm
+*.cnt
+*.kfffrag
+*.pread
+
+# Local benchmark/database outputs.
+*.kmc_pre
+*.kmc_suf
+*.kff
+*.tmp
+
+# Editor and OS noise.
+.DS_Store
+*~
