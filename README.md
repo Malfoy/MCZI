@@ -3,7 +3,7 @@
 MCZI is a Rust toolkit for k-mer set construction and k-mer set subtraction.
 It currently builds three user-facing binaries:
 
-- `MC`: minimizer-based k-mer counting with optional file-of-filenames dataset-presence mode.
+- `MC`: minimizer-count-based k-mer counting.
 - `ZI`: zero-intersection subtraction of an SSHash-indexed FASTA/simplitig k-mer set from query input.
 - `MCZI`: a single-process pipeline that runs MC on an index dataset, builds an SSHash index, then subtracts it from query input.
 
@@ -41,11 +41,6 @@ cargo build --release --bin MC --bin ZI --bin MCZI
 
 The binaries are then available under `target/release/`.
 
-For development builds:
-
-```bash
-cargo build --bin MC --bin ZI --bin MCZI
-```
 
 ## Supported Input And Output Compression
 
@@ -65,9 +60,9 @@ Output compression is selected from the output filename extension:
 
 MC can write FASTA or KFF. ZI and MCZI write FASTA simplitigs.
 
-## FOFN Files
+## File of Files
 
-A FOFN is a text file containing one input path per line:
+A fof is a text file containing one input path per line:
 
 ```text
 # comments and blank lines are ignored
@@ -125,10 +120,10 @@ target/release/MC \
   -t 32
 ```
 
-### MC FOFN Dataset-Presence Mode
+### MC fof Dataset-Presence Mode
 
-In FOFN mode, `-x` changes meaning. It is no longer an abundance threshold.
-It is a dataset-presence threshold, and MC emits k-mers present in more than `X` datasets from the FOFN.
+In fof mode, `-x` changes meaning. It is no longer an abundance threshold.
+It is a dataset-presence threshold, and MC emits k-mers present in more than `X` datasets from the fof.
 
 ```bash
 target/release/MC \
@@ -142,16 +137,15 @@ target/release/MC \
   --threads 16
 ```
 
-Important FOFN semantics:
+Important fof semantics:
 
 - A minimizer is incremented at most once per dataset during the minimizer phase.
 - A k-mer is counted at most once per dataset during the k-mer phase.
 - Datasets are processed one by one.
-- Within a dataset, MC still uses multithreading.
 - A minimizer that can no longer reach the dataset threshold is not kept.
-- FOFN dataset-presence mode currently requires `k <= 32`.
+- fof dataset-presence mode currently requires `k <= 32`.
 
-FOFN mode can also write KFF:
+fof mode can also write KFF:
 
 ```bash
 target/release/MC \
@@ -165,16 +159,11 @@ target/release/MC \
   -t 16
 ```
 
-### MC Constraints
 
-- `k` must be in `1..=64`.
-- `m` must be in `1..=k` and `m <= 64`.
-- Normal abundance mode uses compact `u8` minimizer counts, so `x < 255`.
-- FOFN dataset-presence mode uses `u32` dataset counts and accepts high thresholds, but the current FOFN k-mer path requires `k <= 32`.
 
 ## ZI: Zero Intersection
 
-ZI indexes a FASTA/simplitig file with SSHash and streams query FASTA/FASTQ input.
+ZI indexes a FASTA (with no duplicated kmer) file with SSHash and streams query FASTA/FASTQ input.
 It writes a FASTA simplitig set containing query k-mers that are absent from the indexed k-mer set.
 
 ```bash
@@ -190,7 +179,7 @@ target/release/ZI \
 
 The index file is usually MC FASTA output, but any FASTA/simplitig file with sequences of length at least `k` can be used.
 
-For a query FOFN:
+For a query FOF:
 
 ```bash
 target/release/ZI \
