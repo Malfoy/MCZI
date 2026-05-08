@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use mc::{
-    CounterConfig, count_inputs_minimizer_phase, count_inputs_minimizer_phase_antilex,
-    count_inputs_minimizer_phase_direct, count_inputs_minimizer_phase_packed,
-    count_inputs_minimizer_phase_packed_direct,
+    CounterConfig, DEFAULT_PARTITION_COUNT, count_inputs_minimizer_phase,
+    count_inputs_minimizer_phase_antilex, count_inputs_minimizer_phase_direct,
+    count_inputs_minimizer_phase_packed, count_inputs_minimizer_phase_packed_direct,
 };
 use std::env;
 use std::path::PathBuf;
@@ -38,6 +38,7 @@ fn main() -> Result<()> {
         k,
         minimizer: m,
         threshold: threshold as u64,
+        partition_count: DEFAULT_PARTITION_COUNT,
     };
     let started = Instant::now();
     let unique_hashes = if order == "antilex" {

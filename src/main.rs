@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use mc::{
-    CounterConfig, count_datasets_to_fasta_path, count_datasets_to_kff_path,
-    count_inputs_to_fasta_path, count_inputs_to_kff_path, expand_fofns,
+    CounterConfig, DEFAULT_PARTITION_COUNT, count_datasets_to_fasta_path,
+    count_datasets_to_kff_path, count_inputs_to_fasta_path, count_inputs_to_kff_path, expand_fofns,
 };
 use rayon::ThreadPoolBuilder;
 use std::path::PathBuf;
@@ -52,6 +52,13 @@ struct Cli {
 
     #[arg(short, long, help = "Number of Rayon worker threads")]
     threads: Option<usize>,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PARTITION_COUNT,
+        help = "Number of temporary partition files used by counting phases"
+    )]
+    partition_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -75,6 +82,7 @@ fn main() -> Result<()> {
         k: cli.kmer_size,
         minimizer: cli.minimizer_size,
         threshold: cli.threshold,
+        partition_count: cli.partition_count,
     };
 
     if cli.fofn {

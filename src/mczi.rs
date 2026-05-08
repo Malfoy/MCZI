@@ -6,9 +6,10 @@ use ggcat_api::{
 use helicase::input::FromFile;
 use helicase::{Config, FastxParser, HelicaseParser, ParserOptions};
 use mc::{
-    CounterConfig, EncodedKmer, PhaseMetrics, count_datasets_to_kmer_fasta_path_silent_stats,
-    count_inputs_to_kmer_fasta_path_silent_stats, create_output_writer, decode_kmer, expand_fofns,
-    log_resource_phase, measure_resource_phase, with_xz_decompressed_path,
+    CounterConfig, DEFAULT_PARTITION_COUNT, EncodedKmer, PhaseMetrics,
+    count_datasets_to_kmer_fasta_path_silent_stats, count_inputs_to_kmer_fasta_path_silent_stats,
+    create_output_writer, decode_kmer, expand_fofns, log_resource_phase, measure_resource_phase,
+    with_xz_decompressed_path,
 };
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
@@ -216,6 +217,13 @@ struct Cli {
     #[arg(short, long, help = "Number of worker threads")]
     threads: Option<usize>,
 
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PARTITION_COUNT,
+        help = "Number of temporary MC partition files used by index counting"
+    )]
+    partition_count: usize,
+
     #[arg(long, default_value_t = 8, help = "SSHash build RAM limit in GiB")]
     ram_limit_gib: usize,
 }
@@ -291,9 +299,19 @@ fn run(cli: Cli) -> Result<()> {
         k: cli.kmer_size,
         minimizer: cli.minimizer_size,
         threshold: cli.threshold,
+        partition_count: cli.partition_count,
     };
+    ensure!(
+        config.partition_count > 0,
+        "--partition-count must be greater than 0"
+    );
 
     if cli.index_fofn && cli.threshold >= index_inputs.len() as u64 {
+        eprintln!(
+            "MCZI_WARN\tindex_fofn_threshold_excludes_all_kmers\tindex_inputs\t{}\tthreshold\t{}\tmessage\tno k-mer can pass a dataset-presence threshold greater than or equal to the number of index datasets",
+            index_inputs.len(),
+            cli.threshold
+        );
         log_zero_phase("1_index_minimizer_presence_counting");
         log_zero_phase("2_index_kmer_partition_counting");
         log_mczi_stat("index_minimizers_above_threshold", 0);
@@ -331,9 +349,6 @@ fn run(cli: Cli) -> Result<()> {
             return Err(err);
         }
     };
-    for phase in &selected_stats.phases {
-        log_mczi_phase(phase);
-    }
     log_mczi_stat(
         "index_minimizers_above_threshold",
         selected_stats.minimizers_above_threshold,
@@ -1439,8 +1454,9 @@ where
         .return_record(false)
         .config();
 
-    let mut parser = FastxParser::<CONFIG>::from_file(path)
-        .with_context(|| format!("failed to open FASTA/FASTQ input {}", path.display()))?;
+    let Some(mut parser) = open_fastx_parser::<CONFIG>(path, "FASTA/FASTQ")? else {
+        return Ok(());
+    };
     while parser.next().is_some() {
         let seq = parser.get_dna_string();
         if seq.len() >= min_len {
@@ -1471,8 +1487,9 @@ where
         .return_record(false)
         .config();
 
-    let mut parser = FastxParser::<CONFIG>::from_file(path)
-        .with_context(|| format!("failed to open FASTA/FASTQ input {}", path.display()))?;
+    let Some(mut parser) = open_fastx_parser::<CONFIG>(path, "FASTA/FASTQ")? else {
+        return Ok(());
+    };
     while parser.next().is_some() {
         let seq = parser.get_dna_string();
         if seq.len() >= min_len {
@@ -1480,6 +1497,29 @@ where
         }
     }
     Ok(())
+}
+
+fn open_fastx_parser<const CONFIG: Config>(
+    path: &Path,
+    input_kind: &str,
+) -> Result<Option<FastxParser<'static, CONFIG>>> {
+    match FastxParser::<CONFIG>::from_file(path) {
+        Ok(parser) => Ok(Some(parser)),
+        Err(err) if is_invalid_fastx_record_start(&err) => {
+            eprintln!(
+                "MCZI_WARN\tskipped_invalid_fastx_input\tpath\t{}\terror\t{}",
+                path.display(),
+                err
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to open {input_kind} input {}", path.display())),
+    }
+}
+
+fn is_invalid_fastx_record_start(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Other && err.to_string().starts_with("Invalid record start")
 }
 
 #[cfg(test)]
@@ -1553,7 +1593,7 @@ fn log_zero_phase(name: &'static str) {
 }
 
 fn log_mczi_stat(name: &str, value: u64) {
-    eprintln!("MCZI_STAT\t{name}\t{value}");
+    eprintln!("MCZI_STAT\t{name}\t{}", format_stat_u64(value));
 }
 
 fn log_mczi_output(input_path: &Path, output_path: &Path) {
@@ -1562,6 +1602,28 @@ fn log_mczi_output(input_path: &Path, output_path: &Path) {
         input_path.display(),
         output_path.display()
     );
+}
+
+fn format_stat_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let first_group_len = digits.len() % 3;
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    let mut idx = 0usize;
+
+    if first_group_len != 0 {
+        formatted.push_str(&digits[..first_group_len]);
+        idx = first_group_len;
+    }
+
+    while idx < digits.len() {
+        if !formatted.is_empty() {
+            formatted.push(',');
+        }
+        formatted.push_str(&digits[idx..idx + 3]);
+        idx += 3;
+    }
+
+    formatted
 }
 
 fn log_query_stats(stats: &QuerySubtractionStats) {
@@ -1610,6 +1672,7 @@ mod tests {
             k: 3,
             minimizer: 1,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let index_kmers = count_inputs(&[index], config).unwrap();
         let simplitigs = simplitig_sequences(&index_kmers, 3).unwrap();
@@ -1745,6 +1808,27 @@ mod tests {
     }
 
     #[test]
+    fn regular_output_without_index_skips_invalid_fastx_query_inputs() {
+        let dir = create_temp_dir("mczi-skip-invalid-query-output-test").unwrap();
+        let invalid = dir.join("queries.txt");
+        let valid = dir.join("query.fa");
+        let output = dir.join("regular.fa");
+        fs::write(&invalid, b"not a FASTA or FASTQ file\n").unwrap();
+        fs::write(&valid, b">q\nAAAC\n").unwrap();
+
+        let stats =
+            write_regular_query_output_without_index(&[invalid, valid], 3, &output).unwrap();
+        let text = fs::read_to_string(&output).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(stats.scanned_kmers, 2);
+        assert_eq!(stats.filtered_kmers, 0);
+        assert_eq!(stats.not_filtered_kmers, 2);
+        assert_eq!(stats.regular_output_nucleotides, Some(4));
+        assert_eq!(text, ">q\nAAAC\n");
+    }
+
+    #[test]
     fn no_output_scan_reports_regular_nucleotide_count() {
         let dir = create_temp_dir("mczi-no-output-scan-test").unwrap();
         let query = dir.join("query.fa");
@@ -1776,6 +1860,31 @@ mod tests {
         assert_eq!(stats.filtered_kmers, 0);
         assert_eq!(stats.not_filtered_kmers, 3);
         assert_eq!(stats.regular_output_nucleotides, Some(5));
+    }
+
+    #[test]
+    fn mczi_stat_values_are_comma_grouped() {
+        assert_eq!(format_stat_u64(0), "0");
+        assert_eq!(format_stat_u64(572400), "572,400");
+        assert_eq!(format_stat_u64(9832424437), "9,832,424,437");
+        assert_eq!(format_stat_u64(30162227617), "30,162,227,617");
+    }
+
+    #[test]
+    fn no_output_scan_without_index_skips_invalid_fastx_query_inputs() {
+        let dir = create_temp_dir("mczi-skip-invalid-query-test").unwrap();
+        let invalid = dir.join("queries.txt");
+        let valid = dir.join("query.fa");
+        fs::write(&invalid, b"not a FASTA or FASTQ file\n").unwrap();
+        fs::write(&valid, b">q\nAAAC\n").unwrap();
+
+        let stats = scan_regular_query_output_without_index(&[invalid, valid], 3).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(stats.scanned_kmers, 2);
+        assert_eq!(stats.filtered_kmers, 0);
+        assert_eq!(stats.not_filtered_kmers, 2);
+        assert_eq!(stats.regular_output_nucleotides, Some(4));
     }
 
     #[test]
@@ -1926,6 +2035,7 @@ mod tests {
             reform_output: true,
             reform_abundance_mode: Some(reformer::AbundanceMode::Mean),
             threads: None,
+            partition_count: DEFAULT_PARTITION_COUNT,
             ram_limit_gib: 1,
         })
         .unwrap_err()
@@ -1958,6 +2068,7 @@ mod tests {
             reform_output: false,
             reform_abundance_mode: None,
             threads: None,
+            partition_count: DEFAULT_PARTITION_COUNT,
             ram_limit_gib: 1,
         })
         .unwrap();
@@ -1981,6 +2092,7 @@ mod tests {
             reform_output: true,
             reform_abundance_mode: None,
             threads: None,
+            partition_count: DEFAULT_PARTITION_COUNT,
             ram_limit_gib: 1,
         })
         .unwrap_err()
@@ -2058,6 +2170,7 @@ mod tests {
             reform_output: false,
             reform_abundance_mode: None,
             threads: None,
+            partition_count: DEFAULT_PARTITION_COUNT,
             ram_limit_gib: 1,
         })
         .unwrap();

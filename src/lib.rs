@@ -26,11 +26,8 @@ pub type EncodedKmer = u128;
 type MinimizerHash = u32;
 
 const BATCH_BASES: usize = 128 * 1024 * 1024;
-const MINIMIZER_SHARDS: usize = 1024;
-const MINIMIZER_SHARD_BITS: u32 = 10;
+pub const DEFAULT_PARTITION_COUNT: usize = 1024;
 const MINIMIZER_BUFFER_FLUSH_LEN: usize = 16_384;
-const KMER_COUNT_SHARDS: usize = 1024;
-const KMER_COUNT_SHARD_BITS: u32 = 10;
 const KMER_COUNT_BUFFER_FLUSH_LEN: usize = 16_384;
 const MINIMIZER_TABLE_MIN_SHARD_CAPACITY: usize = 64;
 const ESTIMATED_BYTES_PER_UNIQUE_MINIMIZER_HASH: u64 = 50;
@@ -52,6 +49,7 @@ pub struct CounterConfig {
     pub k: usize,
     pub minimizer: usize,
     pub threshold: Count,
+    pub partition_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +131,10 @@ fn validate_shape_config(config: CounterConfig) -> Result<()> {
         config.minimizer <= 64,
         "minimizer size must be <= 64 because MC stores minimizers in u128"
     );
+    ensure!(
+        config.partition_count > 0,
+        "partition count must be greater than 0"
+    );
     Ok(())
 }
 
@@ -180,8 +182,11 @@ fn run_inputs_phase12_with_order(
     let total_started = Instant::now();
     let result = (|| {
         let phase_started = Instant::now();
-        let minimizer_counts =
-            ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+        let minimizer_counts = ShardedMinimizerCounts::new(
+            config.threshold,
+            estimate_unique_minimizer_hashes(inputs, config.partition_count),
+            config.partition_count,
+        );
         count_input_minimizers_maybe_cached(
             inputs,
             config,
@@ -338,6 +343,7 @@ pub fn count_inputs_to_kmer_fasta_path_with_stats(
         writer.flush()?;
         Ok((written, minimizers_above_threshold))
     });
+    log_resource_phase("MCZI_PHASE", &phase);
 
     let (selected_kmers, minimizers_above_threshold) = result?;
     Ok(KmerFastaWriteStats {
@@ -399,6 +405,7 @@ pub fn count_inputs_to_kmer_fasta_path_silent_stats(
         writer.flush()?;
         Ok((written, minimizers_above_threshold))
     });
+    log_resource_phase("MCZI_PHASE", &phase);
 
     let (selected_kmers, minimizers_above_threshold) = result?;
     Ok(KmerFastaWriteStats {
@@ -535,8 +542,11 @@ fn count_inputs_to_kff_path_u8(
     let total_started = Instant::now();
     let result = (|| {
         let phase_started = Instant::now();
-        let minimizer_counts =
-            ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+        let minimizer_counts = ShardedMinimizerCounts::new(
+            config.threshold,
+            estimate_unique_minimizer_hashes(inputs, config.partition_count),
+            config.partition_count,
+        );
         let order = kff_minimizer_order();
         count_input_minimizers_maybe_cached(
             inputs,
@@ -634,7 +644,7 @@ fn count_dataset_presence_counts_u64(
     if config.threshold >= inputs.len() as Count {
         log_phase("1_dataset_minimizer_counting", Duration::ZERO);
         log_phase("2_dataset_kmer_counting", Duration::ZERO);
-        return Ok(ShardedKmerCountsU64U32::new(0).freeze());
+        return Ok(ShardedKmerCountsU64U32::new(0, config.partition_count).freeze());
     }
 
     let partition_dir = create_partition_dir()?;
@@ -642,8 +652,10 @@ fn count_dataset_presence_counts_u64(
         let order = kff_minimizer_order();
 
         let phase_started = Instant::now();
-        let minimizer_counts =
-            ShardedDatasetMinimizerCounts::new(estimate_unique_minimizer_hashes(inputs));
+        let minimizer_counts = ShardedDatasetMinimizerCounts::new(
+            estimate_unique_minimizer_hashes(inputs, config.partition_count),
+            config.partition_count,
+        );
         for (dataset_idx, path) in inputs.iter().enumerate() {
             let remaining_after = inputs.len() - dataset_idx - 1;
             let accept_new = 1 + remaining_after as Count > config.threshold;
@@ -655,7 +667,10 @@ fn count_dataset_presence_counts_u64(
         log_phase("1_dataset_minimizer_counting", phase_started.elapsed());
 
         let phase_started = Instant::now();
-        let kmer_counts = ShardedKmerCountsU64U32::new(estimate_unique_kmers_for_ram_count(inputs));
+        let kmer_counts = ShardedKmerCountsU64U32::new(
+            estimate_unique_kmers_for_ram_count(inputs, config.partition_count),
+            config.partition_count,
+        );
         if retained_minimizers != 0 {
             for (dataset_idx, path) in inputs.iter().enumerate() {
                 let dataset_dir = dataset_presence_partition_dir(&partition_dir, dataset_idx);
@@ -724,8 +739,10 @@ fn count_dataset_presence_to_kmer_fasta_path(
 
         let (minimizer_result, minimizer_phase) =
             measure_resource_phase("1_index_minimizer_presence_counting", || {
-                let minimizer_counts =
-                    ShardedDatasetMinimizerCounts::new(estimate_unique_minimizer_hashes(inputs));
+                let minimizer_counts = ShardedDatasetMinimizerCounts::new(
+                    estimate_unique_minimizer_hashes(inputs, config.partition_count),
+                    config.partition_count,
+                );
                 for (dataset_idx, path) in inputs.iter().enumerate() {
                     let remaining_after = inputs.len() - dataset_idx - 1;
                     let accept_new = 1 + remaining_after as Count > config.threshold;
@@ -742,10 +759,12 @@ fn count_dataset_presence_to_kmer_fasta_path(
                 let retained_minimizers = minimizer_counts.unique_hashes();
                 Ok((minimizer_counts, retained_minimizers))
             });
-        let (minimizer_counts, retained_minimizers) = minimizer_result?;
         if emit_legacy_logs {
             log_phase("1_dataset_minimizer_counting", minimizer_phase.wall);
+        } else {
+            log_resource_phase("MCZI_PHASE", &minimizer_phase);
         }
+        let (minimizer_counts, retained_minimizers) = minimizer_result?;
 
         let (written_result, kmer_phase) =
             measure_resource_phase("2_index_kmer_partition_counting", || {
@@ -769,6 +788,7 @@ fn count_dataset_presence_to_kmer_fasta_path(
                         process_dataset_kmer_presence_partitions_to_aggregate(
                             &dataset_dir,
                             &aggregate_dir,
+                            config.partition_count,
                         )?;
                         fs::remove_dir_all(&dataset_dir).with_context(|| {
                             format!("failed to remove {}", dataset_dir.display())
@@ -784,10 +804,12 @@ fn count_dataset_presence_to_kmer_fasta_path(
                 writer.flush()?;
                 Ok(written)
             });
-        let written = written_result?;
         if emit_legacy_logs {
             log_phase("2_dataset_kmer_counting", kmer_phase.wall);
+        } else {
+            log_resource_phase("MCZI_PHASE", &kmer_phase);
         }
+        let written = written_result?;
         Ok(KmerFastaWriteStats {
             selected_kmers: written,
             minimizers_above_threshold: retained_minimizers as u64,
@@ -835,8 +857,11 @@ fn count_inputs_to_kff_path_u8_ram(
     let total_started = Instant::now();
     let result = (|| {
         let phase_started = Instant::now();
-        let minimizer_counts =
-            ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+        let minimizer_counts = ShardedMinimizerCounts::new(
+            config.threshold,
+            estimate_unique_minimizer_hashes(inputs, config.partition_count),
+            config.partition_count,
+        );
         count_input_minimizers_maybe_cached(
             inputs,
             config,
@@ -851,7 +876,8 @@ fn count_inputs_to_kff_path_u8_ram(
         let phase_started = Instant::now();
         let kmer_counts = ShardedKmerCountsU64::new(
             config.threshold,
-            estimate_unique_kmers_for_ram_count(inputs),
+            estimate_unique_kmers_for_ram_count(inputs, config.partition_count),
+            config.partition_count,
         );
         count_filtered_kmers_from_inputs_maybe_cached(
             inputs,
@@ -908,8 +934,11 @@ where
     let total_started = Instant::now();
     let result = (|| {
         let phase_started = Instant::now();
-        let minimizer_counts =
-            ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+        let minimizer_counts = ShardedMinimizerCounts::new(
+            config.threshold,
+            estimate_unique_minimizer_hashes(inputs, config.partition_count),
+            config.partition_count,
+        );
         count_input_minimizers_maybe_cached(
             inputs,
             config,
@@ -963,7 +992,11 @@ where
 }
 
 fn log_phase(name: &str, elapsed: Duration) {
-    eprintln!("MC_PHASE\t{name}\t{:.6}", elapsed.as_secs_f64());
+    eprintln!(
+        "MC {} {:.3}s",
+        display_phase_name(name),
+        elapsed.as_secs_f64()
+    );
 }
 
 pub fn measure_resource_phase<T, F>(name: &'static str, f: F) -> (Result<T>, PhaseMetrics)
@@ -978,14 +1011,58 @@ where
 
 pub fn log_resource_phase(prefix: &str, metrics: &PhaseMetrics) {
     eprintln!(
-        "{prefix}\t{}\twall_seconds\t{:.6}\tcpu_seconds\t{:.6}\tuser_cpu_seconds\t{:.6}\tsystem_cpu_seconds\t{:.6}\tmax_rss_kib\t{}",
-        metrics.name,
+        "{} {} {:.3}s CPU {:.3}s {}MB RAM",
+        display_phase_prefix(prefix),
+        display_phase_name(metrics.name),
         metrics.wall.as_secs_f64(),
         metrics.cpu_total().as_secs_f64(),
-        metrics.user_cpu.as_secs_f64(),
-        metrics.system_cpu.as_secs_f64(),
-        metrics.max_rss_kib
+        kib_to_mb(metrics.max_rss_kib)
     );
+}
+
+fn display_phase_prefix(prefix: &str) -> String {
+    prefix.strip_suffix("_PHASE").unwrap_or(prefix).to_string()
+}
+
+fn display_phase_name(name: &str) -> String {
+    if let Some((phase, rest)) = name.split_once('_')
+        && phase.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && phase.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return format!("phase{} {}", phase, compact_phase_detail(rest));
+    }
+    compact_phase_detail(name).to_string()
+}
+
+fn compact_phase_detail(name: &str) -> &str {
+    match name {
+        "minimizer_counting" | "index_minimizer_presence_counting" => "minimizer count",
+        "dataset_minimizer_counting" => "dataset minimizer count",
+        "kmer_counting" | "index_kmer_counting" => "kmer count",
+        "dataset_kmer_counting" => "dataset kmer count",
+        "filtered_kmer_counting" => "filtered kmer count",
+        "index_kmer_partition_counting" => "kmer partition count",
+        "superkmer_partitioning" => "superkmer partition",
+        "output_streaming" => "output",
+        "kmer_counting_and_output" => "kmer count output",
+        "simplitig_output" => "simplitig output",
+        "ggcat_simplitigs" => "ggcat simplitigs",
+        "sshash_indexing" => "sshash index",
+        "query_subtraction" => "query subtraction",
+        "query_subtraction_no_output" => "query scan no output",
+        "query_subtraction_regular_output" | "regular_output" => "regular output",
+        "ggcat_simplitig_output" => "ggcat output",
+        "reform_output" => "reform output",
+        "no_output" => "no output",
+        "fasta_total" => "fasta total",
+        "phase12_total" => "phase12 total",
+        "total" => "total",
+        _ => name,
+    }
+}
+
+fn kib_to_mb(kib: u64) -> u64 {
+    kib.saturating_add(1023) / 1024
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1596,10 +1673,13 @@ fn count_file_minimizers_with_order(
     for_fastx_batches(path, config.k, |batch| {
         batch
             .par_iter()
-            .fold(MinimizerCountWorker::new, |mut worker, seq| {
-                worker.add_seq(seq, config, order, minimizer_counts);
-                worker
-            })
+            .fold(
+                || MinimizerCountWorker::new(config.partition_count),
+                |mut worker, seq| {
+                    worker.add_seq(seq, config, order, minimizer_counts);
+                    worker
+                },
+            )
             .for_each(|mut worker| {
                 worker.flush(minimizer_counts);
             });
@@ -1617,10 +1697,13 @@ fn count_file_minimizers_packed(
     for_fastx_packed_batches(path, config.k, |batch| {
         batch
             .par_iter()
-            .fold(MinimizerCountWorker::new, |mut worker, seq| {
-                worker.add_packed_seq(seq, config, order, minimizer_counts);
-                worker
-            })
+            .fold(
+                || MinimizerCountWorker::new(config.partition_count),
+                |mut worker, seq| {
+                    worker.add_packed_seq(seq, config, order, minimizer_counts);
+                    worker
+                },
+            )
             .for_each(|mut worker| {
                 worker.flush(minimizer_counts);
             });
@@ -1672,10 +1755,13 @@ fn count_file_minimizers_packed_cached(
             while let Ok(batch) = receiver.recv() {
                 batch
                     .par_iter()
-                    .fold(MinimizerCountWorker::new, |mut worker, seq| {
-                        worker.add_packed_seq(seq, config, order, minimizer_counts);
-                        worker
-                    })
+                    .fold(
+                        || MinimizerCountWorker::new(config.partition_count),
+                        |mut worker, seq| {
+                            worker.add_packed_seq(seq, config, order, minimizer_counts);
+                            worker
+                        },
+                    )
                     .for_each(|mut worker| {
                         worker.flush(minimizer_counts);
                     });
@@ -1709,10 +1795,13 @@ fn count_dataset_minimizer_presence(
     for_fastx_packed_batches(path, config.k, |batch| {
         batch
             .into_par_iter()
-            .fold(DatasetMinimizerPresenceWorker::new, |mut worker, seq| {
-                worker.add_packed_seq(&seq, config, order, minimizer_counts, accept_new);
-                worker
-            })
+            .fold(
+                || DatasetMinimizerPresenceWorker::new(config.partition_count),
+                |mut worker, seq| {
+                    worker.add_packed_seq(&seq, config, order, minimizer_counts, accept_new);
+                    worker
+                },
+            )
             .for_each(|mut worker| {
                 worker.flush(minimizer_counts, accept_new);
             });
@@ -1761,8 +1850,11 @@ fn count_inputs_minimizer_phase_with_order(
     validate_config(config)?;
     ensure!(!inputs.is_empty(), "at least one input file is required");
 
-    let minimizer_counts =
-        ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+    let minimizer_counts = ShardedMinimizerCounts::new(
+        config.threshold,
+        estimate_unique_minimizer_hashes(inputs, config.partition_count),
+        config.partition_count,
+    );
     let results: Result<Vec<_>> = inputs
         .par_iter()
         .map(|path| count_file_minimizers_with_order(path, config, order, &minimizer_counts))
@@ -1780,8 +1872,11 @@ fn count_inputs_minimizer_phase_packed_with_order(
     validate_config(config)?;
     ensure!(!inputs.is_empty(), "at least one input file is required");
 
-    let minimizer_counts =
-        ShardedMinimizerCounts::new(config.threshold, estimate_unique_minimizer_hashes(inputs));
+    let minimizer_counts = ShardedMinimizerCounts::new(
+        config.threshold,
+        estimate_unique_minimizer_hashes(inputs, config.partition_count),
+        config.partition_count,
+    );
     let results: Result<Vec<_>> = inputs
         .par_iter()
         .map(|path| count_file_minimizers_packed(path, config, order, &minimizer_counts))
@@ -1798,7 +1893,7 @@ fn write_filtered_superkmer_partitions(
     minimizer_counts: &MinimizerCounts,
     partition_dir: &Path,
 ) -> Result<()> {
-    let writers = SuperkmerPartitionWriters::create(partition_dir)?;
+    let writers = SuperkmerPartitionWriters::create(partition_dir, config.partition_count)?;
     let result: Result<Vec<_>> = inputs
         .par_iter()
         .map(|path| {
@@ -1815,7 +1910,7 @@ fn write_all_superkmer_partitions(
     order: MinimizerOrder,
     partition_dir: &Path,
 ) -> Result<()> {
-    let writers = SuperkmerPartitionWriters::create(partition_dir)?;
+    let writers = SuperkmerPartitionWriters::create(partition_dir, config.partition_count)?;
     let result: Result<Vec<_>> = inputs
         .par_iter()
         .map(|path| write_file_all_superkmers_packed(path, config, order, &writers))
@@ -1852,7 +1947,7 @@ fn write_filtered_superkmer_partitions_from_caches(
     minimizer_counts: &MinimizerCounts,
     partition_dir: &Path,
 ) -> Result<()> {
-    let writers = SuperkmerPartitionWriters::create(partition_dir)?;
+    let writers = SuperkmerPartitionWriters::create(partition_dir, config.partition_count)?;
     let result: Result<Vec<_>> = (0..input_count)
         .into_par_iter()
         .map(|input_idx| {
@@ -1910,7 +2005,7 @@ fn write_all_superkmer_batch(
     let buffers: Result<Vec<_>> = batch
         .into_par_iter()
         .fold(
-            || Ok(SuperkmerWorkerBuffers::new()),
+            || Ok(SuperkmerWorkerBuffers::new(config.partition_count)),
             |buffers, seq| {
                 let mut buffers = buffers?;
                 add_all_superkmers_packed(seq, config, order, writers, &mut buffers)?;
@@ -1936,7 +2031,7 @@ fn write_file_filtered_superkmers_packed(
         let buffers: Result<Vec<_>> = batch
             .into_par_iter()
             .fold(
-                || Ok(SuperkmerWorkerBuffers::new()),
+                || Ok(SuperkmerWorkerBuffers::new(config.partition_count)),
                 |buffers, seq| {
                     let mut buffers = buffers?;
                     add_filtered_superkmers_packed(
@@ -1971,7 +2066,7 @@ fn write_packed_read_cache_filtered_superkmers(
         let buffers: Result<Vec<_>> = batch
             .into_par_iter()
             .fold(
-                || Ok(SuperkmerWorkerBuffers::new()),
+                || Ok(SuperkmerWorkerBuffers::new(config.partition_count)),
                 |buffers, seq| {
                     let mut buffers = buffers?;
                     add_filtered_superkmers_packed(
@@ -2035,10 +2130,13 @@ fn count_filtered_kmers_from_file(
     for_fastx_packed_batches(path, config.k, |batch| {
         batch
             .into_par_iter()
-            .fold(KmerCountWorker::new, |mut worker, seq| {
-                worker.add_filtered_seq(&seq, config, order, minimizer_counts, kmer_counts);
-                worker
-            })
+            .fold(
+                || KmerCountWorker::new(config.partition_count),
+                |mut worker, seq| {
+                    worker.add_filtered_seq(&seq, config, order, minimizer_counts, kmer_counts);
+                    worker
+                },
+            )
             .for_each(|mut worker| {
                 worker.flush(kmer_counts);
             });
@@ -2057,10 +2155,13 @@ fn count_filtered_kmers_from_packed_read_cache(
     for_packed_read_cache_batches(path, config.k, |batch| {
         batch
             .into_par_iter()
-            .fold(KmerCountWorker::new, |mut worker, seq| {
-                worker.add_filtered_seq(&seq, config, order, minimizer_counts, kmer_counts);
-                worker
-            })
+            .fold(
+                || KmerCountWorker::new(config.partition_count),
+                |mut worker, seq| {
+                    worker.add_filtered_seq(&seq, config, order, minimizer_counts, kmer_counts);
+                    worker
+                },
+            )
             .for_each(|mut worker| {
                 worker.flush(kmer_counts);
             });
@@ -2076,12 +2177,12 @@ fn write_dataset_filtered_kmer_partitions(
     minimizer_counts: &DatasetMinimizerCounts,
     dataset_dir: &Path,
 ) -> Result<()> {
-    let writers = KmerPresencePartitionWriters::create(dataset_dir)?;
+    let writers = KmerPresencePartitionWriters::create(dataset_dir, config.partition_count)?;
     for_fastx_packed_batches(path, config.k, |batch| {
         let buffers: Result<Vec<_>> = batch
             .into_par_iter()
             .fold(
-                || Ok(DatasetKmerPresenceWorker::new()),
+                || Ok(DatasetKmerPresenceWorker::new(config.partition_count)),
                 |worker, seq| {
                     let mut worker = worker?;
                     worker.add_filtered_seq(seq, config, order, minimizer_counts, &writers)?;
@@ -2102,7 +2203,7 @@ fn process_dataset_kmer_presence_partitions(
     dataset_dir: &Path,
     kmer_counts: &ShardedKmerCountsU64U32,
 ) -> Result<()> {
-    let results: Result<Vec<_>> = (0..KMER_COUNT_SHARDS)
+    let results: Result<Vec<_>> = (0..kmer_counts.partition_count())
         .into_par_iter()
         .map(|partition_idx| {
             process_dataset_kmer_presence_partition(dataset_dir, partition_idx, kmer_counts)
@@ -2137,8 +2238,9 @@ fn process_dataset_kmer_presence_partition(
 fn process_dataset_kmer_presence_partitions_to_aggregate(
     dataset_dir: &Path,
     aggregate_dir: &Path,
+    partition_count: usize,
 ) -> Result<()> {
-    let results: Result<Vec<_>> = (0..KMER_COUNT_SHARDS)
+    let results: Result<Vec<_>> = (0..partition_count)
         .into_par_iter()
         .map(|partition_idx| {
             process_dataset_kmer_presence_partition_to_aggregate(
@@ -2192,7 +2294,7 @@ fn write_selected_dataset_kmers_from_aggregate_partitions<W: Write>(
     writer: &mut W,
 ) -> Result<u64> {
     let mut written = 0u64;
-    for partition_idx in 0..KMER_COUNT_SHARDS {
+    for partition_idx in 0..config.partition_count {
         let partition_written = write_selected_dataset_kmers_from_aggregate_partition(
             aggregate_dir,
             partition_idx,
@@ -2264,7 +2366,7 @@ where
     F: FnMut(&CountedKmer) -> Result<()>,
 {
     let count_started = Instant::now();
-    let results: Result<Vec<_>> = (0..MINIMIZER_SHARDS)
+    let results: Result<Vec<_>> = (0..config.partition_count)
         .into_par_iter()
         .map(|partition_idx| process_superkmer_partition(partition_dir, partition_idx, config))
         .collect();
@@ -2274,7 +2376,7 @@ where
     }
 
     let emit_started = Instant::now();
-    for partition_idx in 0..MINIMIZER_SHARDS {
+    for partition_idx in 0..config.partition_count {
         let path = counted_partition_path(partition_dir, partition_idx);
         emit_counted_partition(&path, emit)?;
         fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
@@ -2315,7 +2417,7 @@ fn process_superkmer_partitions_to_kff_u8_fragments(
     partition_dir: &Path,
     config: CounterConfig,
 ) -> Result<u64> {
-    let mut partition_indices = (0..MINIMIZER_SHARDS).collect::<Vec<_>>();
+    let mut partition_indices = (0..config.partition_count).collect::<Vec<_>>();
     partition_indices.sort_unstable_by_key(|&partition_idx| {
         std::cmp::Reverse(
             fs::metadata(superkmer_partition_path(partition_dir, partition_idx))
@@ -2465,7 +2567,7 @@ fn emit_kff_u8_fragments(
     let mut writer = create_output_writer(output_path)?;
     write_kff_header_with_count_size(&mut writer, config, record_count, false, 1)?;
 
-    for partition_idx in 0..MINIMIZER_SHARDS {
+    for partition_idx in 0..config.partition_count {
         let path = kff_fragment_partition_path(partition_dir, partition_idx);
         let file =
             File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -2735,7 +2837,7 @@ fn saturating_compact_delta(delta: usize) -> CompactCount {
     delta.min(CompactCount::MAX as usize) as CompactCount
 }
 
-fn estimate_unique_minimizer_hashes(inputs: &[PathBuf]) -> usize {
+fn estimate_unique_minimizer_hashes(inputs: &[PathBuf], partition_count: usize) -> usize {
     let bytes_per_hash = if should_cache_packed_reads(inputs) {
         ESTIMATED_COMPRESSED_BYTES_PER_UNIQUE_MINIMIZER_HASH
     } else {
@@ -2747,14 +2849,14 @@ fn estimate_unique_minimizer_hashes(inputs: &[PathBuf]) -> usize {
         .map(|metadata| metadata.len())
         .sum::<u64>();
     (bytes / bytes_per_hash)
-        .max(MINIMIZER_SHARDS as u64)
+        .max(partition_count as u64)
         .min(usize::MAX as u64) as usize
 }
 
-fn estimate_unique_kmers_for_ram_count(inputs: &[PathBuf]) -> usize {
+fn estimate_unique_kmers_for_ram_count(inputs: &[PathBuf], partition_count: usize) -> usize {
     let bytes = input_file_bytes(inputs);
     (bytes / ESTIMATED_COMPRESSED_BYTES_PER_UNIQUE_KMER)
-        .max(KMER_COUNT_SHARDS as u64)
+        .max(partition_count as u64)
         .min(usize::MAX as u64) as usize
 }
 
@@ -2811,12 +2913,12 @@ fn directory_file_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn minimizer_shard(hash: MinimizerHash) -> usize {
-    (hash >> (MinimizerHash::BITS - MINIMIZER_SHARD_BITS)) as usize
+fn minimizer_shard(hash: MinimizerHash, partition_count: usize) -> usize {
+    spread_hash_u32(hash) as usize % partition_count
 }
 
-fn kmer_count_shard(encoded: u64) -> usize {
-    (spread_hash_u64(encoded) >> (u64::BITS - KMER_COUNT_SHARD_BITS)) as usize
+fn kmer_count_shard(encoded: u64, partition_count: usize) -> usize {
+    spread_hash_u64(encoded) as usize % partition_count
 }
 
 fn simplitig_partition(
@@ -3120,8 +3222,9 @@ where
         .return_record(false)
         .config();
 
-    let mut parser = FastxParser::<CONFIG>::from_file(path)
-        .with_context(|| format!("failed to open FASTA/FASTQ input {}", path.display()))?;
+    let Some(mut parser) = open_fastx_parser::<CONFIG>(path, "FASTA/FASTQ")? else {
+        return Ok(());
+    };
     let mut batch = Vec::new();
     let mut bases = 0usize;
 
@@ -3165,8 +3268,9 @@ where
         .return_record(false)
         .config();
 
-    let mut parser = FastxParser::<CONFIG>::from_file(path)
-        .with_context(|| format!("failed to open FASTA/FASTQ input {}", path.display()))?;
+    let Some(mut parser) = open_fastx_parser::<CONFIG>(path, "FASTA/FASTQ")? else {
+        return Ok(());
+    };
     let mut batch = Vec::new();
     let mut bases = 0usize;
 
@@ -3215,12 +3319,15 @@ where
         .return_record(false)
         .config();
 
-    let mut parser = FastxParser::<CONFIG>::from_file(path)
-        .with_context(|| format!("failed to open FASTA/FASTQ input {}", path.display()))?;
     let cache = File::create(cache_path)
         .with_context(|| format!("failed to create {}", cache_path.display()))?;
     let mut cache = BufWriter::with_capacity(16 * 1024 * 1024, cache);
     cache.write_all(PACKED_READ_CACHE_MAGIC)?;
+
+    let Some(mut parser) = open_fastx_parser::<CONFIG>(path, "FASTA/FASTQ")? else {
+        cache.flush()?;
+        return Ok(());
+    };
 
     let mut batch = Vec::new();
     let mut bases = 0usize;
@@ -3248,6 +3355,29 @@ where
 
     cache.flush()?;
     Ok(())
+}
+
+fn open_fastx_parser<const CONFIG: Config>(
+    path: &Path,
+    input_kind: &str,
+) -> Result<Option<FastxParser<'static, CONFIG>>> {
+    match FastxParser::<CONFIG>::from_file(path) {
+        Ok(parser) => Ok(Some(parser)),
+        Err(err) if is_invalid_fastx_record_start(&err) => {
+            eprintln!(
+                "MC_WARN\tskipped_invalid_fastx_input\tpath\t{}\terror\t{}",
+                path.display(),
+                err
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to open {input_kind} input {}", path.display())),
+    }
+}
+
+fn is_invalid_fastx_record_start(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Other && err.to_string().starts_with("Invalid record start")
 }
 
 fn write_packed_read_cache_batch<W: Write>(writer: &mut W, batch: &[PackedSeqVec]) -> Result<()> {
@@ -3724,13 +3854,13 @@ struct MinimizerShardBuffers {
 }
 
 impl MinimizerShardBuffers {
-    fn new() -> Self {
-        let buffers = (0..MINIMIZER_SHARDS).map(|_| Vec::new()).collect();
+    fn new(partition_count: usize) -> Self {
+        let buffers = (0..partition_count).map(|_| Vec::new()).collect();
         Self { buffers }
     }
 
     fn add(&mut self, hash: MinimizerHash, delta: CompactCount, counts: &ShardedMinimizerCounts) {
-        let shard_idx = minimizer_shard(hash);
+        let shard_idx = minimizer_shard(hash, counts.partition_count());
         let buffer = &mut self.buffers[shard_idx];
         buffer.push((hash, delta));
         if buffer.len() >= MINIMIZER_BUFFER_FLUSH_LEN {
@@ -3750,8 +3880,8 @@ struct DatasetMinimizerShardBuffers {
 }
 
 impl DatasetMinimizerShardBuffers {
-    fn new() -> Self {
-        let buffers = (0..MINIMIZER_SHARDS).map(|_| Vec::new()).collect();
+    fn new(partition_count: usize) -> Self {
+        let buffers = (0..partition_count).map(|_| Vec::new()).collect();
         Self { buffers }
     }
 
@@ -3761,7 +3891,7 @@ impl DatasetMinimizerShardBuffers {
         counts: &ShardedDatasetMinimizerCounts,
         accept_new: bool,
     ) {
-        let shard_idx = minimizer_shard(hash);
+        let shard_idx = minimizer_shard(hash, counts.partition_count());
         let buffer = &mut self.buffers[shard_idx];
         buffer.push(hash);
         if buffer.len() >= MINIMIZER_BUFFER_FLUSH_LEN {
@@ -3782,9 +3912,9 @@ struct MinimizerCountWorker {
 }
 
 impl MinimizerCountWorker {
-    fn new() -> Self {
+    fn new(partition_count: usize) -> Self {
         Self {
-            updates: MinimizerShardBuffers::new(),
+            updates: MinimizerShardBuffers::new(partition_count),
             minimizer_runs: MinimizerRunBuffers::default(),
         }
     }
@@ -3820,9 +3950,9 @@ struct DatasetMinimizerPresenceWorker {
 }
 
 impl DatasetMinimizerPresenceWorker {
-    fn new() -> Self {
+    fn new(partition_count: usize) -> Self {
         Self {
-            updates: DatasetMinimizerShardBuffers::new(),
+            updates: DatasetMinimizerShardBuffers::new(partition_count),
             minimizer_runs: MinimizerRunBuffers::default(),
         }
     }
@@ -3856,13 +3986,13 @@ struct KmerShardBuffers {
 }
 
 impl KmerShardBuffers {
-    fn new() -> Self {
-        let buffers = (0..KMER_COUNT_SHARDS).map(|_| Vec::new()).collect();
+    fn new(partition_count: usize) -> Self {
+        let buffers = (0..partition_count).map(|_| Vec::new()).collect();
         Self { buffers }
     }
 
     fn add(&mut self, encoded: u64, counts: &ShardedKmerCountsU64) {
-        let shard_idx = kmer_count_shard(encoded);
+        let shard_idx = kmer_count_shard(encoded, counts.partition_count());
         let buffer = &mut self.buffers[shard_idx];
         buffer.push(encoded);
         if buffer.len() >= KMER_COUNT_BUFFER_FLUSH_LEN {
@@ -3884,9 +4014,9 @@ struct KmerCountWorker {
 }
 
 impl KmerCountWorker {
-    fn new() -> Self {
+    fn new(partition_count: usize) -> Self {
         Self {
-            updates: KmerShardBuffers::new(),
+            updates: KmerShardBuffers::new(partition_count),
             minimizer_runs: MinimizerRunBuffers::default(),
             canonical_kmers: Vec::new(),
         }
@@ -3937,9 +4067,9 @@ struct DatasetKmerPresenceWorker {
 }
 
 impl DatasetKmerPresenceWorker {
-    fn new() -> Self {
+    fn new(partition_count: usize) -> Self {
         Self {
-            kmers: KmerPresenceShardBuffers::new(),
+            kmers: KmerPresenceShardBuffers::new(partition_count),
             minimizer_runs: MinimizerRunBuffers::default(),
             canonical_kmers: Vec::new(),
             filtered_runs: Vec::new(),
@@ -3992,13 +4122,13 @@ struct KmerPresenceShardBuffers {
 }
 
 impl KmerPresenceShardBuffers {
-    fn new() -> Self {
-        let buffers = (0..KMER_COUNT_SHARDS).map(|_| Vec::new()).collect();
+    fn new(partition_count: usize) -> Self {
+        let buffers = (0..partition_count).map(|_| Vec::new()).collect();
         Self { buffers }
     }
 
     fn add(&mut self, encoded: u64, writers: &KmerPresencePartitionWriters) -> Result<()> {
-        let partition_idx = kmer_count_shard(encoded);
+        let partition_idx = kmer_count_shard(encoded, writers.partition_count());
         let buffer = &mut self.buffers[partition_idx];
         buffer.extend_from_slice(&encoded.to_be_bytes());
         if buffer.len() >= SUPERKMER_BUFFER_FLUSH_BYTES {
@@ -4015,8 +4145,8 @@ impl KmerPresenceShardBuffers {
     }
 }
 
-fn minimizer_table_shard_capacity(estimated_unique_hashes: usize) -> usize {
-    let per_shard = estimated_unique_hashes.div_ceil(MINIMIZER_SHARDS);
+fn minimizer_table_shard_capacity(estimated_unique_hashes: usize, partition_count: usize) -> usize {
+    let per_shard = estimated_unique_hashes.div_ceil(partition_count);
     minimizer_table_capacity_for_items(per_shard)
 }
 
@@ -4385,13 +4515,17 @@ struct ShardedMinimizerCounts {
 }
 
 impl ShardedMinimizerCounts {
-    fn new(threshold: Count, estimated_unique_hashes: usize) -> Self {
+    fn new(threshold: Count, estimated_unique_hashes: usize, partition_count: usize) -> Self {
         let saturation = (threshold + 1) as CompactCount;
-        let capacity = minimizer_table_shard_capacity(estimated_unique_hashes);
-        let shards = (0..MINIMIZER_SHARDS)
+        let capacity = minimizer_table_shard_capacity(estimated_unique_hashes, partition_count);
+        let shards = (0..partition_count)
             .map(|_| Mutex::new(CompactMinimizerTable::with_capacity(capacity, saturation)))
             .collect();
         Self { shards }
+    }
+
+    fn partition_count(&self) -> usize {
+        self.shards.len()
     }
 
     fn add_buffer(&self, shard_idx: usize, updates: &mut Vec<(MinimizerHash, CompactCount)>) {
@@ -4423,12 +4557,16 @@ struct ShardedDatasetMinimizerCounts {
 }
 
 impl ShardedDatasetMinimizerCounts {
-    fn new(estimated_unique_hashes: usize) -> Self {
-        let capacity = minimizer_table_shard_capacity(estimated_unique_hashes);
-        let shards = (0..MINIMIZER_SHARDS)
+    fn new(estimated_unique_hashes: usize, partition_count: usize) -> Self {
+        let capacity = minimizer_table_shard_capacity(estimated_unique_hashes, partition_count);
+        let shards = (0..partition_count)
             .map(|_| Mutex::new(DatasetMinimizerTable::with_capacity(capacity)))
             .collect();
         Self { shards }
+    }
+
+    fn partition_count(&self) -> usize {
+        self.shards.len()
     }
 
     fn add_buffer(&self, shard_idx: usize, updates: &mut Vec<MinimizerHash>, accept_new: bool) {
@@ -4474,7 +4612,7 @@ struct MinimizerCounts {
 
 impl MinimizerCounts {
     fn is_above_threshold(&self, hash: MinimizerHash, threshold: Count) -> bool {
-        self.shards[minimizer_shard(hash)]
+        self.shards[minimizer_shard(hash, self.shards.len())]
             .get(hash)
             .is_some_and(|&count| count as Count > threshold)
     }
@@ -4490,7 +4628,7 @@ struct DatasetMinimizerCounts {
 
 impl DatasetMinimizerCounts {
     fn is_above_threshold(&self, hash: MinimizerHash, threshold: Count) -> bool {
-        self.shards[minimizer_shard(hash)]
+        self.shards[minimizer_shard(hash, self.shards.len())]
             .get_count(hash)
             .is_some_and(|count| count as Count > threshold)
     }
@@ -4505,13 +4643,17 @@ struct ShardedKmerCountsU64 {
 }
 
 impl ShardedKmerCountsU64 {
-    fn new(threshold: Count, estimated_unique_kmers: usize) -> Self {
+    fn new(threshold: Count, estimated_unique_kmers: usize, partition_count: usize) -> Self {
         let saturation = (threshold + 1) as u8;
-        let capacity = estimated_unique_kmers.div_ceil(KMER_COUNT_SHARDS);
-        let shards = (0..KMER_COUNT_SHARDS)
+        let capacity = estimated_unique_kmers.div_ceil(partition_count);
+        let shards = (0..partition_count)
             .map(|_| Mutex::new(CompactKmerTableU64::with_capacity(capacity, saturation)))
             .collect();
         Self { shards }
+    }
+
+    fn partition_count(&self) -> usize {
+        self.shards.len()
     }
 
     fn add_buffer(&self, shard_idx: usize, updates: &mut Vec<u64>) {
@@ -4563,12 +4705,16 @@ struct ShardedKmerCountsU64U32 {
 }
 
 impl ShardedKmerCountsU64U32 {
-    fn new(estimated_unique_kmers: usize) -> Self {
-        let capacity = estimated_unique_kmers.div_ceil(KMER_COUNT_SHARDS);
-        let shards = (0..KMER_COUNT_SHARDS)
+    fn new(estimated_unique_kmers: usize, partition_count: usize) -> Self {
+        let capacity = estimated_unique_kmers.div_ceil(partition_count);
+        let shards = (0..partition_count)
             .map(|_| Mutex::new(KmerTableU64U32::with_capacity(capacity)))
             .collect();
         Self { shards }
+    }
+
+    fn partition_count(&self) -> usize {
+        self.shards.len()
     }
 
     fn add_buffer(&self, shard_idx: usize, updates: &mut Vec<u64>) {
@@ -4620,8 +4766,8 @@ struct KmerPresencePartitionWriters {
 }
 
 impl KmerPresencePartitionWriters {
-    fn create(dataset_dir: &Path) -> Result<Self> {
-        let writers: Result<Vec<_>> = (0..KMER_COUNT_SHARDS)
+    fn create(dataset_dir: &Path, partition_count: usize) -> Result<Self> {
+        let writers: Result<Vec<_>> = (0..partition_count)
             .map(|partition_idx| {
                 let path = dataset_kmer_presence_partition_path(dataset_dir, partition_idx);
                 let file = File::create(&path)
@@ -4632,6 +4778,10 @@ impl KmerPresencePartitionWriters {
         Ok(Self {
             writers: writers?.into_boxed_slice(),
         })
+    }
+
+    fn partition_count(&self) -> usize {
+        self.writers.len()
     }
 
     fn write_buffer(&self, partition_idx: usize, buffer: &mut Vec<u8>) -> Result<()> {
@@ -4662,8 +4812,8 @@ struct SuperkmerPartitionWriters {
 }
 
 impl SuperkmerPartitionWriters {
-    fn create(partition_dir: &Path) -> Result<Self> {
-        let writers: Result<Vec<_>> = (0..MINIMIZER_SHARDS)
+    fn create(partition_dir: &Path, partition_count: usize) -> Result<Self> {
+        let writers: Result<Vec<_>> = (0..partition_count)
             .map(|partition_idx| {
                 let path = superkmer_partition_path(partition_dir, partition_idx);
                 let file = File::create(&path)
@@ -4674,6 +4824,10 @@ impl SuperkmerPartitionWriters {
         Ok(Self {
             writers: writers?.into_boxed_slice(),
         })
+    }
+
+    fn partition_count(&self) -> usize {
+        self.writers.len()
     }
 
     fn write_buffer(&self, partition_idx: usize, buffer: &mut Vec<u8>) -> Result<()> {
@@ -4710,9 +4864,9 @@ struct SuperkmerWorkerBuffers {
 }
 
 impl SuperkmerWorkerBuffers {
-    fn new() -> Self {
+    fn new(partition_count: usize) -> Self {
         Self {
-            superkmers: SuperkmerShardBuffers::new(),
+            superkmers: SuperkmerShardBuffers::new(partition_count),
             minimizer_runs: MinimizerRunBuffers::default(),
             filtered_runs: Vec::new(),
         }
@@ -4720,8 +4874,8 @@ impl SuperkmerWorkerBuffers {
 }
 
 impl SuperkmerShardBuffers {
-    fn new() -> Self {
-        let buffers = (0..MINIMIZER_SHARDS).map(|_| Vec::new()).collect();
+    fn new(partition_count: usize) -> Self {
+        let buffers = (0..partition_count).map(|_| Vec::new()).collect();
         Self { buffers }
     }
 
@@ -4741,7 +4895,7 @@ impl SuperkmerShardBuffers {
             start + len <= packed.len() * 4,
             "packed super-kmer range exceeds sequence length"
         );
-        let partition_idx = minimizer_shard(hash);
+        let partition_idx = minimizer_shard(hash, writers.partition_count());
         let buffer = &mut self.buffers[partition_idx];
         append_record_len(buffer, len as u32);
         append_packed_dna_range(buffer, packed, start, len);
@@ -4793,6 +4947,7 @@ mod tests {
                 k,
                 minimizer: 1,
                 threshold: 0,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
             &mut actual,
         );
@@ -4818,6 +4973,7 @@ mod tests {
             k,
             minimizer: 1,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let mut packed = Vec::new();
         append_packed_dna_seq(&mut packed, seq);
@@ -4840,6 +4996,7 @@ mod tests {
             k,
             minimizer: m,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let total_windows = seq.len().saturating_sub(k) + usize::from(seq.len() >= k);
         let mut ranges = Vec::new();
@@ -5253,6 +5410,7 @@ mod tests {
             k: 1,
             minimizer: 1,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         true
@@ -5263,6 +5421,7 @@ mod tests {
             k: 64,
             minimizer: 64,
             threshold: 254,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         true
@@ -5273,6 +5432,7 @@ mod tests {
             k: 0,
             minimizer: 1,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5283,6 +5443,7 @@ mod tests {
             k: 65,
             minimizer: 1,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5293,6 +5454,7 @@ mod tests {
             k: 3,
             minimizer: 0,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5303,6 +5465,7 @@ mod tests {
             k: 3,
             minimizer: 4,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5313,6 +5476,7 @@ mod tests {
             k: 64,
             minimizer: 65,
             threshold: 0,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5323,6 +5487,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 255,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5333,6 +5498,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1000,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         false,
         false
@@ -5343,6 +5509,7 @@ mod tests {
             k: 32,
             minimizer: 21,
             threshold: 300,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         true,
         true
@@ -5353,6 +5520,7 @@ mod tests {
             k: 33,
             minimizer: 21,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         true,
         false
@@ -5363,6 +5531,7 @@ mod tests {
             k: 31,
             minimizer: 21,
             threshold: DATASET_PRESENCE_COUNT_MASK as Count,
+            partition_count: DEFAULT_PARTITION_COUNT,
         },
         true,
         false
@@ -5381,6 +5550,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let mut packed = Vec::new();
         append_packed_dna_seq(&mut packed, seq);
@@ -5402,6 +5572,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let path = dir.join("reads.fa");
@@ -5433,6 +5604,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let path = dir.join("reads.fa.gz");
@@ -5464,6 +5636,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let path = dir.join("reads.fa.xz");
@@ -5487,6 +5660,98 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_counter_skips_invalid_fastx_inputs() {
+        use std::io::Write as _;
+
+        let config = CounterConfig {
+            k: 3,
+            minimizer: 2,
+            threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
+        };
+        let dir = create_partition_dir().unwrap();
+        let invalid = dir.join("not_fastx.txt");
+        let valid = dir.join("reads.fa");
+        fs::write(&invalid, b"not a FASTA or FASTQ file\n").unwrap();
+        let mut file = File::create(&valid).unwrap();
+        writeln!(file, ">read").unwrap();
+        writeln!(file, "ACGTACGT").unwrap();
+        drop(file);
+
+        let kmers = count_inputs(&[invalid, valid], config).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(kmers.contains(&CountedKmer {
+            encoded: encode(b"ACG"),
+            count: 4
+        }));
+        assert!(kmers.contains(&CountedKmer {
+            encoded: encode(b"GTA"),
+            count: 2
+        }));
+    }
+
+    #[test]
+    fn partitioned_counter_skips_invalid_compressed_fastx_inputs() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let config = CounterConfig {
+            k: 3,
+            minimizer: 2,
+            threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
+        };
+        let dir = create_partition_dir().unwrap();
+        let invalid = dir.join("not_fastx.txt.gz");
+        let valid = dir.join("reads.fa");
+        let file = File::create(&invalid).unwrap();
+        let mut writer = GzEncoder::new(file, Compression::fast());
+        writeln!(writer, "not a FASTA or FASTQ file").unwrap();
+        writer.finish().unwrap();
+        let mut file = File::create(&valid).unwrap();
+        writeln!(file, ">read").unwrap();
+        writeln!(file, "ACGTACGT").unwrap();
+        drop(file);
+
+        let kmers = count_inputs(&[invalid, valid], config).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(kmers.contains(&CountedKmer {
+            encoded: encode(b"ACG"),
+            count: 4
+        }));
+        assert!(kmers.contains(&CountedKmer {
+            encoded: encode(b"GTA"),
+            count: 2
+        }));
+    }
+
+    #[test]
+    fn partition_writers_use_requested_partition_count() {
+        let dir = create_partition_dir().unwrap();
+        let superkmer_dir = dir.join("superkmers");
+        let presence_dir = dir.join("presence");
+        fs::create_dir(&superkmer_dir).unwrap();
+        fs::create_dir(&presence_dir).unwrap();
+
+        let writers = SuperkmerPartitionWriters::create(&superkmer_dir, 3).unwrap();
+        assert_eq!(writers.partition_count(), 3);
+        writers.finish().unwrap();
+        let superkmer_files = fs::read_dir(&superkmer_dir).unwrap().count();
+        assert_eq!(superkmer_files, 3);
+
+        let writers = KmerPresencePartitionWriters::create(&presence_dir, 5).unwrap();
+        assert_eq!(writers.partition_count(), 5);
+        writers.finish().unwrap();
+        let presence_files = fs::read_dir(&presence_dir).unwrap().count();
+        assert_eq!(presence_files, 5);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn dataset_presence_counter_counts_each_dataset_once() {
         use std::io::Write as _;
 
@@ -5494,6 +5759,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 2,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let d1 = dir.join("dataset1.fa");
@@ -5533,6 +5799,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 2,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let d1 = dir.join("dataset1.fa");
@@ -5572,6 +5839,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 300,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let dir = create_partition_dir().unwrap();
         let d1 = dir.join("dataset1.fa");
@@ -5699,6 +5967,7 @@ mod tests {
             k: 3,
             minimizer: 2,
             threshold: 1,
+            partition_count: DEFAULT_PARTITION_COUNT,
         };
         let kmers = vec![CountedKmer {
             encoded: encode(b"ACG"),
@@ -5761,6 +6030,7 @@ mod tests {
                 k: 3,
                 minimizer: 2,
                 threshold: 1,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
         )
         .unwrap();
@@ -5770,6 +6040,7 @@ mod tests {
                 k: 3,
                 minimizer: 2,
                 threshold: 2,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
         )
         .unwrap();
@@ -5802,6 +6073,7 @@ mod tests {
                 k: 3,
                 minimizer: 2,
                 threshold: 1,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
         )
         .unwrap();
@@ -5834,6 +6106,7 @@ mod tests {
                 k: 3,
                 minimizer: 2,
                 threshold: 1,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
             &output,
         )
@@ -5867,6 +6140,7 @@ mod tests {
                 k: 3,
                 minimizer: 2,
                 threshold: 1,
+                partition_count: DEFAULT_PARTITION_COUNT,
             },
             &output,
         )
@@ -5879,6 +6153,23 @@ mod tests {
         assert_eq!(stats.phases[0].name, "1_index_minimizer_presence_counting");
         assert_eq!(stats.phases[1].name, "2_index_kmer_partition_counting");
         assert!(text.contains(">MC_kmer_1 count=2\nAAA\n"));
+    }
+
+    #[test]
+    fn phase_log_names_are_compact() {
+        assert_eq!(
+            display_phase_name("1_index_minimizer_presence_counting"),
+            "phase1 minimizer count"
+        );
+        assert_eq!(
+            display_phase_name("2_index_kmer_partition_counting"),
+            "phase2 kmer partition count"
+        );
+        assert_eq!(
+            display_phase_name("5_query_subtraction_no_output"),
+            "phase5 query scan no output"
+        );
+        assert_eq!(display_phase_name("3a_kmer_counting"), "phase3a kmer count");
     }
 
     #[test]
@@ -5911,17 +6202,17 @@ mod tests {
             "--abundance-mode mean",
             "--abundance-mode runs",
             "--threads",
+            "--partition-count",
             "--ram-limit-gib",
-            "MC_PHASE",
+            "MC phase1",
             "ZI_PHASE",
-            "MCZI_PHASE",
+            "MCZI phase1",
             "MCZI_STAT",
             "MCZI_OUTPUT",
             "R_PHASE",
             "R_STAT",
-            "wall_seconds",
-            "cpu_seconds",
-            "max_rss_kib",
+            "CPU",
+            "RAM",
             "index_minimizers_above_threshold",
             "query_kmers_filtered_by_zi",
             "query_regular_output_nucleotides",

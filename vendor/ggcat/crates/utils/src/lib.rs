@@ -23,7 +23,7 @@ macro_rules! panic_debug {
 
 pub fn compute_best_m(k: usize) -> usize {
     match k {
-        0..=13 => max(k / 2, k - 4),
+        0..=13 => max(k / 2, k.saturating_sub(4)),
         14..=15 => 9,
         16..=21 => 10,
         22..=30 => 11,

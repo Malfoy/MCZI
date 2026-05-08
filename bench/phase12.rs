@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use mc::{
-    CounterConfig, run_inputs_phase12, run_inputs_phase12_antilex, run_inputs_phase12_direct,
+    CounterConfig, DEFAULT_PARTITION_COUNT, run_inputs_phase12, run_inputs_phase12_antilex,
+    run_inputs_phase12_direct,
 };
 use std::env;
 use std::path::PathBuf;
@@ -31,6 +32,7 @@ fn main() -> Result<()> {
         k,
         minimizer: m,
         threshold: threshold as u64,
+        partition_count: DEFAULT_PARTITION_COUNT,
     };
     let stats = match order.as_str() {
         "direct" => run_inputs_phase12_direct(&[PathBuf::from(input)], config)?,

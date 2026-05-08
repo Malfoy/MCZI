@@ -107,6 +107,7 @@ MC options:
 - `--format fasta`: write FASTA simplitigs
 - `--format kff`: write KFF with counts
 - `--threads`, `-t`: Rayon worker count
+- `--partition-count`: temporary partition file count for counting phases; default `1024`
 
 Write KFF instead of FASTA:
 
@@ -285,6 +286,7 @@ MCZI options:
 - `--reform-output`: apply in-process R-style `K-1` merging to the final output
 - `--reform-abundance-mode mean|runs`: preserve `km:f` abundance during regular-output reforming
 - `--threads`, `-t`: Rayon/GGCAT worker count
+- `--partition-count`: temporary MC partition file count for index counting; default `1024`
 - `--ram-limit-gib`: SSHash and GGCAT RAM limit
 
 MCZI output modes:
@@ -345,7 +347,7 @@ MC is organized as a KMC-style multi-pass counter.
 
 1. It parses FASTA/FASTQ with `helicase`, using DNA-only parsing and splitting on non-ACGT bases.
 2. It computes canonical minimizers with `simd-minimizers`.
-3. It stores minimizer counts in 1024 sharded hash tables. The shard is selected from the high bits of the 32-bit minimizer hash, and each shard is protected by its own mutex.
+3. It stores minimizer counts in sharded hash tables. The shard count is controlled by `--partition-count` and defaults to `1024`.
 4. Normal minimizer counts are compact `u8` saturating counts. They only need to distinguish `<= x` from `> x`.
 5. It runs a second streaming pass and writes only super-kmers whose minimizer passed the threshold.
 6. Super-kmers are written in a compact binary partition format under a temporary `mc-partitions-*` directory.
@@ -404,14 +406,16 @@ This keeps the large simplitig construction out of MCZI's in-memory hash-map bui
 
 ### Phase, Resource, And Stat Logs
 
-The tools write machine-readable progress lines to stderr.
+The tools write compact progress lines to stderr as soon as each phase finishes.
 
-- `MC_PHASE	<name>	<seconds>` is emitted by MC phases.
+- `MC phase1 minimizer count <wall>s` is emitted by MC phases.
 - `ZI_PHASE	<name>	<seconds>` is emitted by ZI phases.
 - `R_PHASE	<name>	<seconds>` and `R_STAT	<name>	<value>` are emitted by R.
-- `MCZI_PHASE	<name>	wall_seconds	<wall>	cpu_seconds	<cpu>	user_cpu_seconds	<user>	system_cpu_seconds	<sys>	max_rss_kib	<rss>` is emitted by MCZI phases.
+- `MCZI phase1 minimizer count <wall>s CPU <cpu>s <rss>MB RAM` is emitted by MCZI phases.
 - `MCZI_STAT	<name>	<value>` is emitted for key MCZI counts.
 - `MCZI_OUTPUT	<input>	<output>` is emitted for each per-file output in `--query-fofn` mode.
+
+Large MCZI stat values are comma-grouped, for example `MCZI_STAT	query_kmers_scanned	9,832,424,437`.
 
 MCZI currently reports:
 
