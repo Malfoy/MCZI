@@ -14,7 +14,9 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, mem};
 
@@ -38,6 +40,8 @@ const RAM_KMER_COUNT_MAX_INPUT_BYTES: u64 = 0;
 const SUPERKMER_BUFFER_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 const PHASE3_IO_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_PHASE3_BUCKET_BITS: u32 = 8;
+const DEFAULT_SIMPLITIG_PARTITION_FACTOR: usize = 16;
+const MAX_SIMPLITIG_PARTITIONS: usize = 1024;
 const KFF_ENCODING_ACGT: u8 = 0x1b;
 const PACKED_READ_CACHE_MAGIC: &[u8; 8] = b"MCRD0001";
 const DATASET_PRESENCE_SEEN_BIT: u32 = 1 << 31;
@@ -70,6 +74,39 @@ pub struct Phase12Stats {
     pub total: Duration,
     pub unique_minimizer_hashes: usize,
     pub partition_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhaseMetrics {
+    pub name: &'static str,
+    pub wall: Duration,
+    pub user_cpu: Duration,
+    pub system_cpu: Duration,
+    pub max_rss_kib: u64,
+}
+
+impl PhaseMetrics {
+    pub fn zero(name: &'static str) -> Self {
+        Self {
+            name,
+            wall: Duration::ZERO,
+            user_cpu: Duration::ZERO,
+            system_cpu: Duration::ZERO,
+            max_rss_kib: current_rss_kib(),
+        }
+    }
+
+    pub fn cpu_total(&self) -> Duration {
+        self.user_cpu + self.system_cpu
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KmerFastaWriteStats {
+    pub selected_kmers: u64,
+    pub minimizers_above_threshold: u64,
+    pub phases: Vec<PhaseMetrics>,
+    pub total: Duration,
 }
 
 pub fn validate_config(config: CounterConfig) -> Result<()> {
@@ -259,6 +296,125 @@ pub fn count_datasets(inputs: &[PathBuf], config: CounterConfig) -> Result<Vec<C
     }
     counted.sort_unstable_by_key(|record| record.encoded);
     Ok(counted)
+}
+
+pub fn count_inputs_to_kmer_fasta_path(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<u64> {
+    Ok(count_inputs_to_kmer_fasta_path_with_stats(inputs, config, output_path)?.selected_kmers)
+}
+
+pub fn count_inputs_to_kmer_fasta_path_with_stats(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<KmerFastaWriteStats> {
+    let total_started = Instant::now();
+    let file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+    let mut written = 0u64;
+
+    let (result, phase) = measure_resource_phase("1_index_kmer_counting", || {
+        let minimizers_above_threshold = count_inputs_partitioned_with_stats(
+            inputs,
+            config,
+            |record| {
+                written = written
+                    .checked_add(1)
+                    .context("selected k-mer count overflow")?;
+                write_kmer_fasta_record_u128(
+                    &mut writer,
+                    written,
+                    record.encoded,
+                    config.k,
+                    record.count,
+                )
+            },
+            true,
+        )?;
+        writer.flush()?;
+        Ok((written, minimizers_above_threshold))
+    });
+
+    let (selected_kmers, minimizers_above_threshold) = result?;
+    Ok(KmerFastaWriteStats {
+        selected_kmers,
+        minimizers_above_threshold,
+        phases: vec![phase],
+        total: total_started.elapsed(),
+    })
+}
+
+pub fn count_datasets_to_kmer_fasta_path(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<u64> {
+    Ok(count_datasets_to_kmer_fasta_path_with_stats(inputs, config, output_path)?.selected_kmers)
+}
+
+pub fn count_datasets_to_kmer_fasta_path_with_stats(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<KmerFastaWriteStats> {
+    count_dataset_presence_to_kmer_fasta_path(inputs, config, output_path, true)
+}
+
+fn write_kmer_fasta_from_counted_partitions<W: Write>(
+    writer: &mut W,
+    written: &mut u64,
+    config: CounterConfig,
+    record: &CountedKmer,
+) -> Result<()> {
+    *written = (*written)
+        .checked_add(1)
+        .context("selected k-mer count overflow")?;
+    write_kmer_fasta_record_u128(writer, *written, record.encoded, config.k, record.count)
+}
+
+pub fn count_inputs_to_kmer_fasta_path_silent_stats(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<KmerFastaWriteStats> {
+    let total_started = Instant::now();
+    let file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+    let mut written = 0u64;
+
+    let (result, phase) = measure_resource_phase("1_index_kmer_counting", || {
+        let minimizers_above_threshold = count_inputs_partitioned_with_stats(
+            inputs,
+            config,
+            |record| {
+                write_kmer_fasta_from_counted_partitions(&mut writer, &mut written, config, record)
+            },
+            false,
+        )?;
+        writer.flush()?;
+        Ok((written, minimizers_above_threshold))
+    });
+
+    let (selected_kmers, minimizers_above_threshold) = result?;
+    Ok(KmerFastaWriteStats {
+        selected_kmers,
+        minimizers_above_threshold,
+        phases: vec![phase],
+        total: total_started.elapsed(),
+    })
+}
+
+pub fn count_datasets_to_kmer_fasta_path_silent_stats(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+) -> Result<KmerFastaWriteStats> {
+    count_dataset_presence_to_kmer_fasta_path(inputs, config, output_path, false)
 }
 
 pub fn count_inputs_to_fasta_path(
@@ -475,6 +631,12 @@ fn count_dataset_presence_counts_u64(
     validate_dataset_presence_config(config)?;
     ensure!(!inputs.is_empty(), "at least one dataset file is required");
 
+    if config.threshold >= inputs.len() as Count {
+        log_phase("1_dataset_minimizer_counting", Duration::ZERO);
+        log_phase("2_dataset_kmer_counting", Duration::ZERO);
+        return Ok(ShardedKmerCountsU64U32::new(0).freeze());
+    }
+
     let partition_dir = create_partition_dir()?;
     let result = (|| {
         let order = kff_minimizer_order();
@@ -513,6 +675,125 @@ fn count_dataset_presence_counts_u64(
         }
         log_phase("2_dataset_kmer_counting", phase_started.elapsed());
         Ok(kmer_counts.freeze())
+    })();
+
+    if result.is_ok() {
+        fs::remove_dir_all(&partition_dir)
+            .with_context(|| format!("failed to remove {}", partition_dir.display()))?;
+    } else {
+        let _ = fs::remove_dir_all(&partition_dir);
+    }
+
+    result
+}
+
+fn count_dataset_presence_to_kmer_fasta_path(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    output_path: &Path,
+    emit_legacy_logs: bool,
+) -> Result<KmerFastaWriteStats> {
+    validate_dataset_presence_config(config)?;
+    ensure!(!inputs.is_empty(), "at least one dataset file is required");
+
+    let total_started = Instant::now();
+    let file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+
+    if config.threshold >= inputs.len() as Count {
+        if emit_legacy_logs {
+            log_phase("1_dataset_minimizer_counting", Duration::ZERO);
+            log_phase("2_dataset_kmer_counting", Duration::ZERO);
+        }
+        writer.flush()?;
+        return Ok(KmerFastaWriteStats {
+            selected_kmers: 0,
+            minimizers_above_threshold: 0,
+            phases: vec![
+                PhaseMetrics::zero("1_index_minimizer_presence_counting"),
+                PhaseMetrics::zero("2_index_kmer_partition_counting"),
+            ],
+            total: total_started.elapsed(),
+        });
+    }
+
+    let partition_dir = create_partition_dir()?;
+    let result = (|| {
+        let order = kff_minimizer_order();
+
+        let (minimizer_result, minimizer_phase) =
+            measure_resource_phase("1_index_minimizer_presence_counting", || {
+                let minimizer_counts =
+                    ShardedDatasetMinimizerCounts::new(estimate_unique_minimizer_hashes(inputs));
+                for (dataset_idx, path) in inputs.iter().enumerate() {
+                    let remaining_after = inputs.len() - dataset_idx - 1;
+                    let accept_new = 1 + remaining_after as Count > config.threshold;
+                    count_dataset_minimizer_presence(
+                        path,
+                        config,
+                        order,
+                        &minimizer_counts,
+                        accept_new,
+                    )?;
+                    minimizer_counts.finish_dataset(remaining_after, config.threshold);
+                }
+                let minimizer_counts = minimizer_counts.freeze();
+                let retained_minimizers = minimizer_counts.unique_hashes();
+                Ok((minimizer_counts, retained_minimizers))
+            });
+        let (minimizer_counts, retained_minimizers) = minimizer_result?;
+        if emit_legacy_logs {
+            log_phase("1_dataset_minimizer_counting", minimizer_phase.wall);
+        }
+
+        let (written_result, kmer_phase) =
+            measure_resource_phase("2_index_kmer_partition_counting", || {
+                let aggregate_dir = partition_dir.join("dataset_presence_aggregate");
+                fs::create_dir(&aggregate_dir)
+                    .with_context(|| format!("failed to create {}", aggregate_dir.display()))?;
+                if retained_minimizers != 0 {
+                    for (dataset_idx, path) in inputs.iter().enumerate() {
+                        let dataset_dir =
+                            dataset_presence_partition_dir(&partition_dir, dataset_idx);
+                        fs::create_dir(&dataset_dir).with_context(|| {
+                            format!("failed to create {}", dataset_dir.display())
+                        })?;
+                        write_dataset_filtered_kmer_partitions(
+                            path,
+                            config,
+                            order,
+                            &minimizer_counts,
+                            &dataset_dir,
+                        )?;
+                        process_dataset_kmer_presence_partitions_to_aggregate(
+                            &dataset_dir,
+                            &aggregate_dir,
+                        )?;
+                        fs::remove_dir_all(&dataset_dir).with_context(|| {
+                            format!("failed to remove {}", dataset_dir.display())
+                        })?;
+                    }
+                }
+
+                let written = write_selected_dataset_kmers_from_aggregate_partitions(
+                    &aggregate_dir,
+                    config,
+                    &mut writer,
+                )?;
+                writer.flush()?;
+                Ok(written)
+            });
+        let written = written_result?;
+        if emit_legacy_logs {
+            log_phase("2_dataset_kmer_counting", kmer_phase.wall);
+        }
+        Ok(KmerFastaWriteStats {
+            selected_kmers: written,
+            minimizers_above_threshold: retained_minimizers as u64,
+            phases: vec![minimizer_phase, kmer_phase],
+            total: total_started.elapsed(),
+        })
     })();
 
     if result.is_ok() {
@@ -607,6 +888,18 @@ fn count_inputs_partitioned<F>(inputs: &[PathBuf], config: CounterConfig, mut em
 where
     F: FnMut(&CountedKmer) -> Result<()>,
 {
+    count_inputs_partitioned_with_stats(inputs, config, &mut emit, true).map(|_| ())
+}
+
+fn count_inputs_partitioned_with_stats<F>(
+    inputs: &[PathBuf],
+    config: CounterConfig,
+    mut emit: F,
+    emit_legacy_logs: bool,
+) -> Result<u64>
+where
+    F: FnMut(&CountedKmer) -> Result<()>,
+{
     validate_config(config)?;
     ensure!(!inputs.is_empty(), "at least one input file is required");
 
@@ -626,7 +919,10 @@ where
             use_read_cache,
         )?;
         let minimizer_counts = minimizer_counts.freeze();
-        log_phase("1_minimizer_counting", phase_started.elapsed());
+        let retained_minimizers = minimizer_counts.unique_hashes() as u64;
+        if emit_legacy_logs {
+            log_phase("1_minimizer_counting", phase_started.elapsed());
+        }
 
         let phase_started = Instant::now();
         write_filtered_superkmer_partitions_maybe_cached(
@@ -640,11 +936,16 @@ where
         if use_read_cache {
             remove_packed_read_caches(&partition_dir, inputs.len())?;
         }
-        log_phase("2_superkmer_partitioning", phase_started.elapsed());
+        if emit_legacy_logs {
+            log_phase("2_superkmer_partitioning", phase_started.elapsed());
+        }
 
         let phase_started = Instant::now();
-        process_superkmer_partitions(&partition_dir, config, &mut emit)
-            .inspect(|_| log_phase("3_kmer_counting_and_output", phase_started.elapsed()))
+        process_superkmer_partitions(&partition_dir, config, &mut emit, emit_legacy_logs)?;
+        if emit_legacy_logs {
+            log_phase("3_kmer_counting_and_output", phase_started.elapsed());
+        }
+        Ok(retained_minimizers)
     })();
 
     if result.is_ok() {
@@ -654,26 +955,243 @@ where
         let _ = fs::remove_dir_all(&partition_dir);
     }
 
-    result.inspect(|_| log_phase("total", total_started.elapsed()))
+    if emit_legacy_logs {
+        result.inspect(|_| log_phase("total", total_started.elapsed()))
+    } else {
+        result
+    }
 }
 
 fn log_phase(name: &str, elapsed: Duration) {
     eprintln!("MC_PHASE\t{name}\t{:.6}", elapsed.as_secs_f64());
 }
 
+pub fn measure_resource_phase<T, F>(name: &'static str, f: F) -> (Result<T>, PhaseMetrics)
+where
+    F: FnOnce() -> Result<T>,
+{
+    let tracker = ResourceTracker::start();
+    let result = f();
+    let metrics = tracker.finish(name);
+    (result, metrics)
+}
+
+pub fn log_resource_phase(prefix: &str, metrics: &PhaseMetrics) {
+    eprintln!(
+        "{prefix}\t{}\twall_seconds\t{:.6}\tcpu_seconds\t{:.6}\tuser_cpu_seconds\t{:.6}\tsystem_cpu_seconds\t{:.6}\tmax_rss_kib\t{}",
+        metrics.name,
+        metrics.wall.as_secs_f64(),
+        metrics.cpu_total().as_secs_f64(),
+        metrics.user_cpu.as_secs_f64(),
+        metrics.system_cpu.as_secs_f64(),
+        metrics.max_rss_kib
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CpuTimes {
+    user: Duration,
+    system: Duration,
+}
+
+struct ResourceTracker {
+    started: Instant,
+    cpu_start: CpuTimes,
+    stop: Arc<AtomicBool>,
+    max_rss_kib: Arc<AtomicU64>,
+    sampler: Option<JoinHandle<()>>,
+}
+
+impl ResourceTracker {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_rss_kib = Arc::new(AtomicU64::new(current_rss_kib()));
+        let sampler_stop = Arc::clone(&stop);
+        let sampler_max = Arc::clone(&max_rss_kib);
+        let sampler = thread::spawn(move || {
+            while !sampler_stop.load(Ordering::Acquire) {
+                update_atomic_max(&sampler_max, current_rss_kib());
+                thread::sleep(Duration::from_millis(100));
+            }
+            update_atomic_max(&sampler_max, current_rss_kib());
+        });
+
+        Self {
+            started: Instant::now(),
+            cpu_start: current_cpu_times(),
+            stop,
+            max_rss_kib,
+            sampler: Some(sampler),
+        }
+    }
+
+    fn finish(mut self, name: &'static str) -> PhaseMetrics {
+        let wall = self.started.elapsed();
+        let cpu_end = current_cpu_times();
+        self.stop.store(true, Ordering::Release);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+
+        PhaseMetrics {
+            name,
+            wall,
+            user_cpu: cpu_end
+                .user
+                .checked_sub(self.cpu_start.user)
+                .unwrap_or(Duration::ZERO),
+            system_cpu: cpu_end
+                .system
+                .checked_sub(self.cpu_start.system)
+                .unwrap_or(Duration::ZERO),
+            max_rss_kib: self.max_rss_kib.load(Ordering::Acquire),
+        }
+    }
+}
+
+fn current_cpu_times() -> CpuTimes {
+    let mut usage = mem::MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return CpuTimes {
+            user: Duration::ZERO,
+            system: Duration::ZERO,
+        };
+    }
+
+    let usage = unsafe { usage.assume_init() };
+    CpuTimes {
+        user: timeval_to_duration(usage.ru_utime),
+        system: timeval_to_duration(usage.ru_stime),
+    }
+}
+
+fn timeval_to_duration(timeval: libc::timeval) -> Duration {
+    let secs = timeval.tv_sec.max(0) as u64;
+    let micros = timeval.tv_usec.max(0) as u32;
+    Duration::new(secs, micros.saturating_mul(1_000))
+}
+
+fn current_rss_kib() -> u64 {
+    let Ok(statm) = fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(rss_pages) = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return 0;
+    };
+    rss_pages.saturating_mul(page_size_bytes()) / 1024
+}
+
+fn page_size_bytes() -> u64 {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        4096
+    } else {
+        page_size as u64
+    }
+}
+
+fn update_atomic_max(max_value: &AtomicU64, candidate: u64) {
+    let mut previous = max_value.load(Ordering::Relaxed);
+    while candidate > previous {
+        match max_value.compare_exchange_weak(
+            previous,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next) => previous = next,
+        }
+    }
+}
+
 pub fn write_fasta<W: Write>(mut writer: W, kmers: &[CountedKmer], k: usize) -> Result<()> {
-    write_simplitigs(&mut writer, kmers, k)
+    write_simplitigs(&mut writer, kmers, k, 0).map(|_| ())
+}
+
+pub fn write_fasta_after_index<W: Write>(
+    mut writer: W,
+    kmers: &[CountedKmer],
+    k: usize,
+    last_written_index: usize,
+) -> Result<usize> {
+    write_simplitigs(&mut writer, kmers, k, last_written_index)
 }
 
 pub fn write_fasta_path(output_path: &Path, kmers: &[CountedKmer], k: usize) -> Result<()> {
     let mut writer = create_output_writer(output_path)?;
-    write_simplitigs(&mut writer, kmers, k)?;
+    write_simplitigs(&mut writer, kmers, k, 0)?;
     writer.finish()
 }
 
 pub fn simplitig_sequences(kmers: &[CountedKmer], k: usize) -> Result<Vec<Vec<u8>>> {
+    simplitig_sequences_from_encoded(kmers.iter().map(|record| record.encoded), k)
+}
+
+pub fn simplitig_sequences_from_kmers(kmers: Vec<CountedKmer>, k: usize) -> Result<Vec<Vec<u8>>> {
+    simplitig_sequences_from_encoded(kmers.into_iter().map(|record| record.encoded), k)
+}
+
+pub fn simplitig_sequences_from_kmers_parallel(
+    mut kmers: Vec<CountedKmer>,
+    k: usize,
+    minimizer: usize,
+) -> Result<Vec<Vec<u8>>> {
+    validate_output_k(k)?;
+    ensure!(
+        minimizer > 0 && minimizer <= k,
+        "minimizer size must be > 0 and <= k"
+    );
+    ensure!(
+        minimizer <= 64,
+        "minimizer size must be <= 64 because MC stores minimizers in u128"
+    );
+    let partition_count = simplitig_partition_count();
+    kmers.par_sort_unstable_by_key(|record| {
+        simplitig_partition(record.encoded, k, minimizer, partition_count)
+    });
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < kmers.len() {
+        let partition_idx =
+            simplitig_partition(kmers[start].encoded, k, minimizer, partition_count);
+        let mut end = start + 1;
+        while end < kmers.len()
+            && simplitig_partition(kmers[end].encoded, k, minimizer, partition_count)
+                == partition_idx
+        {
+            end += 1;
+        }
+        ranges.push((start, end));
+        start = end;
+    }
+
+    ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            simplitig_sequences_from_encoded(
+                kmers[start..end].iter().map(|record| record.encoded),
+                k,
+            )
+        })
+        .try_reduce(Vec::new, |mut left, mut right| {
+            left.append(&mut right);
+            Ok(left)
+        })
+}
+
+fn simplitig_sequences_from_encoded<I>(encoded_kmers: I, k: usize) -> Result<Vec<Vec<u8>>>
+where
+    I: IntoIterator<Item = EncodedKmer>,
+{
     let mut sequences = Vec::new();
-    for_each_simplitig(kmers, k, |seq, _| {
+    for_each_simplitig_encoded(encoded_kmers, k, |seq, _| {
         sequences.push(seq.to_vec());
         Ok(())
     })?;
@@ -715,7 +1233,7 @@ enum OutputWriterInner {
 }
 
 impl OutputWriter {
-    fn finish(self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
         match self.inner {
             OutputWriterInner::Plain(mut writer) => {
                 writer.flush()?;
@@ -757,7 +1275,7 @@ impl Write for OutputWriter {
     }
 }
 
-fn create_output_writer(output_path: &Path) -> Result<OutputWriter> {
+pub fn create_output_writer(output_path: &Path) -> Result<OutputWriter> {
     let file = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
     let writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
@@ -844,24 +1362,44 @@ fn write_simplitig_fasta_path(output_path: &Path, k: usize, kmers: &[CountedKmer
     write_fasta_path(output_path, kmers, k)
 }
 
-fn write_simplitigs<W: Write>(writer: &mut W, kmers: &[CountedKmer], k: usize) -> Result<()> {
+fn write_simplitigs<W: Write>(
+    writer: &mut W,
+    kmers: &[CountedKmer],
+    k: usize,
+    last_written_index: usize,
+) -> Result<usize> {
+    let mut last_index = last_written_index;
     for_each_simplitig(kmers, k, |seq, simplitig_idx| {
-        write_simplitig_record(writer, simplitig_idx, seq, k)
-    })
+        last_index = last_written_index
+            .checked_add(simplitig_idx)
+            .context("simplitig index overflow")?;
+        write_simplitig_record(writer, last_index, seq, k)
+    })?;
+    Ok(last_index)
 }
 
 fn for_each_simplitig<F>(kmers: &[CountedKmer], k: usize, mut emit: F) -> Result<()>
 where
     F: FnMut(&[u8], usize) -> Result<()>,
 {
+    for_each_simplitig_encoded(kmers.iter().map(|record| record.encoded), k, |seq, idx| {
+        emit(seq, idx)
+    })
+}
+
+fn for_each_simplitig_encoded<I, F>(encoded_kmers: I, k: usize, mut emit: F) -> Result<()>
+where
+    I: IntoIterator<Item = EncodedKmer>,
+    F: FnMut(&[u8], usize) -> Result<()>,
+{
     validate_output_k(k)?;
-    if kmers.is_empty() {
-        return Ok(());
+    let mut remaining = AHashMap::new();
+    for encoded in encoded_kmers {
+        remaining.insert(encoded, ());
     }
 
-    let mut remaining = AHashMap::with_capacity(kmers.len());
-    for record in kmers {
-        remaining.insert(record.encoded, ());
+    if remaining.is_empty() {
+        return Ok(());
     }
 
     let mut seeds = remaining.keys().copied().collect::<Vec<_>>();
@@ -904,6 +1442,27 @@ fn write_seq_lines<W: Write>(writer: &mut W, seq: &[u8]) -> Result<()> {
         writer.write_all(b"\n")?;
     }
     Ok(())
+}
+
+fn write_kmer_fasta_record_u128<W: Write>(
+    writer: &mut W,
+    idx: u64,
+    encoded: EncodedKmer,
+    k: usize,
+    count: Count,
+) -> Result<()> {
+    writeln!(writer, ">MC_kmer_{} count={}", idx, count)?;
+    write_seq_lines(writer, &decode_kmer(encoded, k))
+}
+
+fn write_kmer_fasta_record_u64<W: Write>(
+    writer: &mut W,
+    idx: u64,
+    encoded: u64,
+    k: usize,
+    count: Count,
+) -> Result<()> {
+    write_kmer_fasta_record_u128(writer, idx, encoded as EncodedKmer, k, count)
 }
 
 fn extend_simplitig_forward(
@@ -1575,10 +2134,131 @@ fn process_dataset_kmer_presence_partition(
     Ok(())
 }
 
+fn process_dataset_kmer_presence_partitions_to_aggregate(
+    dataset_dir: &Path,
+    aggregate_dir: &Path,
+) -> Result<()> {
+    let results: Result<Vec<_>> = (0..KMER_COUNT_SHARDS)
+        .into_par_iter()
+        .map(|partition_idx| {
+            process_dataset_kmer_presence_partition_to_aggregate(
+                dataset_dir,
+                aggregate_dir,
+                partition_idx,
+            )
+        })
+        .collect();
+    results?;
+    Ok(())
+}
+
+fn process_dataset_kmer_presence_partition_to_aggregate(
+    dataset_dir: &Path,
+    aggregate_dir: &Path,
+    partition_idx: usize,
+) -> Result<()> {
+    let path = dataset_kmer_presence_partition_path(dataset_dir, partition_idx);
+    let mut kmers = Vec::with_capacity(estimated_partition_kmers(&path) / mem::size_of::<u64>());
+
+    let file = File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+    let mut buf = [0u8; 8];
+    while let Some(encoded) = read_u64_opt_be(&mut reader, &mut buf)? {
+        kmers.push(encoded);
+    }
+
+    kmers.sort_unstable();
+    kmers.dedup();
+
+    let aggregate_path = dataset_kmer_presence_partition_path(aggregate_dir, partition_idx);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&aggregate_path)
+        .with_context(|| format!("failed to open {}", aggregate_path.display()))?;
+    let mut writer = BufWriter::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+    for encoded in kmers {
+        writer.write_all(&encoded.to_be_bytes())?;
+    }
+    writer.flush()?;
+
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(())
+}
+
+fn write_selected_dataset_kmers_from_aggregate_partitions<W: Write>(
+    aggregate_dir: &Path,
+    config: CounterConfig,
+    writer: &mut W,
+) -> Result<u64> {
+    let mut written = 0u64;
+    for partition_idx in 0..KMER_COUNT_SHARDS {
+        let partition_written = write_selected_dataset_kmers_from_aggregate_partition(
+            aggregate_dir,
+            partition_idx,
+            config,
+            writer,
+            written,
+        )?;
+        written = written
+            .checked_add(partition_written)
+            .context("selected k-mer count overflow")?;
+    }
+    Ok(written)
+}
+
+fn write_selected_dataset_kmers_from_aggregate_partition<W: Write>(
+    aggregate_dir: &Path,
+    partition_idx: usize,
+    config: CounterConfig,
+    writer: &mut W,
+    already_written: u64,
+) -> Result<u64> {
+    let path = dataset_kmer_presence_partition_path(aggregate_dir, partition_idx);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let mut kmers = Vec::with_capacity(estimated_partition_kmers(&path) / mem::size_of::<u64>());
+    let file = File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(PHASE3_IO_BUFFER_BYTES, file);
+    let mut buf = [0u8; 8];
+    while let Some(encoded) = read_u64_opt_be(&mut reader, &mut buf)? {
+        kmers.push(encoded);
+    }
+
+    kmers.sort_unstable();
+    let mut idx = 0usize;
+    let mut written = 0u64;
+    while idx < kmers.len() {
+        let encoded = kmers[idx];
+        let start = idx;
+        idx += 1;
+        while idx < kmers.len() && kmers[idx] == encoded {
+            idx += 1;
+        }
+
+        let presence = (idx - start) as Count;
+        if presence > config.threshold {
+            written = written
+                .checked_add(1)
+                .context("selected k-mer count overflow")?;
+            let record_idx = already_written
+                .checked_add(written)
+                .context("selected k-mer count overflow")?;
+            write_kmer_fasta_record_u64(writer, record_idx, encoded, config.k, presence)?;
+        }
+    }
+
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(written)
+}
+
 fn process_superkmer_partitions<F>(
     partition_dir: &Path,
     config: CounterConfig,
     emit: &mut F,
+    emit_legacy_logs: bool,
 ) -> Result<()>
 where
     F: FnMut(&CountedKmer) -> Result<()>,
@@ -1589,7 +2269,9 @@ where
         .map(|partition_idx| process_superkmer_partition(partition_dir, partition_idx, config))
         .collect();
     results?;
-    log_phase("3a_kmer_counting", count_started.elapsed());
+    if emit_legacy_logs {
+        log_phase("3a_kmer_counting", count_started.elapsed());
+    }
 
     let emit_started = Instant::now();
     for partition_idx in 0..MINIMIZER_SHARDS {
@@ -1597,7 +2279,9 @@ where
         emit_counted_partition(&path, emit)?;
         fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
     }
-    log_phase("3b_output_streaming", emit_started.elapsed());
+    if emit_legacy_logs {
+        log_phase("3b_output_streaming", emit_started.elapsed());
+    }
     Ok(())
 }
 fn process_superkmer_partition(
@@ -2133,6 +2817,50 @@ fn minimizer_shard(hash: MinimizerHash) -> usize {
 
 fn kmer_count_shard(encoded: u64) -> usize {
     (spread_hash_u64(encoded) >> (u64::BITS - KMER_COUNT_SHARD_BITS)) as usize
+}
+
+fn simplitig_partition(
+    encoded: EncodedKmer,
+    k: usize,
+    minimizer: usize,
+    partition_count: usize,
+) -> usize {
+    debug_assert!(partition_count.is_power_of_two());
+    let minimizer = canonical_minimizer_value(encoded, k, minimizer);
+    spread_hash_u32(minimizer_hash_u128(minimizer)) as usize & (partition_count - 1)
+}
+
+fn canonical_minimizer_value(encoded: EncodedKmer, k: usize, minimizer: usize) -> EncodedKmer {
+    debug_assert!(minimizer > 0 && minimizer <= k && minimizer <= 64);
+    let mask = kmer_mask(minimizer);
+    let mut best = EncodedKmer::MAX;
+    for start in 0..=k - minimizer {
+        let shift = 2 * (k - start - minimizer);
+        let value = (encoded >> shift) & mask;
+        best = best.min(value.min(reverse_complement_encoded(value, minimizer)));
+    }
+    best
+}
+
+fn reverse_complement_encoded(mut encoded: EncodedKmer, len: usize) -> EncodedKmer {
+    let mut rc = 0;
+    for _ in 0..len {
+        rc = (rc << 2) | ((encoded & 0b11) ^ 0b11);
+        encoded >>= 2;
+    }
+    rc
+}
+
+fn simplitig_partition_count() -> usize {
+    let default = rayon::current_num_threads().saturating_mul(DEFAULT_SIMPLITIG_PARTITION_FACTOR);
+    let requested = env::var("MC_SIMPLITIG_PARTITIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default);
+    requested
+        .clamp(1, MAX_SIMPLITIG_PARTITIONS)
+        .next_power_of_two()
+        .min(MAX_SIMPLITIG_PARTITIONS)
 }
 
 fn minimizer_hash_u64(value: u64) -> MinimizerHash {
@@ -4165,6 +4893,18 @@ mod tests {
         assert_eq!(represented, records.len());
     }
 
+    fn represented_kmers(simplitigs: &[Vec<u8>], k: usize) -> Vec<EncodedKmer> {
+        let mut kmers = Vec::new();
+        for seq in simplitigs {
+            for window in seq.windows(k) {
+                kmers.push(canonical_encoded(window));
+            }
+        }
+        kmers.sort_unstable();
+        kmers.dedup();
+        kmers
+    }
+
     fn assert_validation_result(config: CounterConfig, dataset_mode: bool, should_pass: bool) {
         let result = if dataset_mode {
             validate_dataset_presence_config(config)
@@ -4472,6 +5212,41 @@ mod tests {
         b"AACCGTA"
     );
 
+    #[test]
+    fn parallel_simplitigs_partition_by_canonical_minimizer() {
+        let partition_count = 16;
+        let first = canonical_encoded(b"AAAAC");
+        let second = canonical_encoded(b"AAACC");
+
+        assert_eq!(
+            simplitig_partition(first, 5, 3, partition_count),
+            simplitig_partition(second, 5, 3, partition_count)
+        );
+    }
+
+    #[test]
+    fn parallel_simplitigs_preserve_unique_kmer_set() {
+        let mut records = [b"AAA", b"AAC", b"ACG", b"CGT", b"AAC"]
+            .into_iter()
+            .map(|kmer| CountedKmer {
+                encoded: canonical_encoded(kmer),
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| record.encoded);
+
+        let simplitigs = simplitig_sequences_from_kmers_parallel(records, 3, 2).unwrap();
+        let expected = [b"AAA", b"AAC", b"ACG", b"CGT"]
+            .into_iter()
+            .map(|kmer| canonical_encoded(kmer))
+            .collect::<Vec<_>>();
+        let mut expected = expected;
+        expected.sort_unstable();
+        expected.dedup();
+
+        assert_eq!(represented_kmers(&simplitigs, 3), expected);
+    }
+
     validation_case!(
         validation_accepts_minimal_normal_config,
         CounterConfig {
@@ -4751,6 +5526,45 @@ mod tests {
     }
 
     #[test]
+    fn dataset_presence_kmer_fasta_streams_selected_kmers() {
+        use std::io::Write as _;
+
+        let config = CounterConfig {
+            k: 3,
+            minimizer: 2,
+            threshold: 2,
+        };
+        let dir = create_partition_dir().unwrap();
+        let d1 = dir.join("dataset1.fa");
+        let d2 = dir.join("dataset2.fa");
+        let d3 = dir.join("dataset3.fa");
+        let output = dir.join("selected.fa");
+
+        let mut file = File::create(&d1).unwrap();
+        writeln!(file, ">d1").unwrap();
+        writeln!(file, "AAAACGACG").unwrap();
+        drop(file);
+
+        let mut file = File::create(&d2).unwrap();
+        writeln!(file, ">d2").unwrap();
+        writeln!(file, "AAAACGTTT").unwrap();
+        drop(file);
+
+        let mut file = File::create(&d3).unwrap();
+        writeln!(file, ">d3").unwrap();
+        writeln!(file, "GGGACGCCC").unwrap();
+        drop(file);
+
+        let written = count_datasets_to_kmer_fasta_path(&[d1, d2, d3], config, &output).unwrap();
+        let text = fs::read_to_string(&output).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(written, 1);
+        assert!(text.contains("\nACG\n"));
+        assert!(!text.contains("\nAAA\n"));
+    }
+
+    #[test]
     fn dataset_presence_counter_accepts_high_threshold() {
         use std::io::Write as _;
 
@@ -4802,6 +5616,31 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(">MC_simplitig_1 kmers=3\n"));
         assert!(text.contains("AAACG\n"));
+    }
+
+    #[test]
+    fn fasta_output_can_continue_simplitig_numbering() {
+        let kmers = vec![
+            CountedKmer {
+                encoded: encode(b"AAA"),
+                count: 1,
+            },
+            CountedKmer {
+                encoded: encode(b"AAC"),
+                count: 1,
+            },
+            CountedKmer {
+                encoded: encode(b"ACG"),
+                count: 1,
+            },
+        ];
+        let mut out = Vec::new();
+
+        let last_index = write_fasta_after_index(&mut out, &kmers, 3, 7).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(last_index, 8);
+        assert!(text.contains(">MC_simplitig_8 kmers=3\n"));
     }
 
     #[test]
@@ -4869,5 +5708,227 @@ mod tests {
         write_kff(&mut out, &kmers, config).unwrap();
         assert!(out.starts_with(b"KFF"));
         assert!(out.ends_with(b"KFF"));
+    }
+
+    #[test]
+    fn fofn_expansion_resolves_relative_paths_and_ignores_comments() {
+        let dir = create_partition_dir().unwrap();
+        let nested = dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let input_a = nested.join("a.fa");
+        let input_b = dir.join("b.fa");
+        let fofn = dir.join("inputs.fofn");
+        fs::write(&input_a, b">a\nAAA\n").unwrap();
+        fs::write(&input_b, b">b\nCCC\n").unwrap();
+        fs::write(
+            &fofn,
+            format!("\n# comment\nnested/a.fa\n{}\n", input_b.to_string_lossy()),
+        )
+        .unwrap();
+
+        let expanded = expand_fofns(&[fofn]).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(expanded, vec![input_a, input_b]);
+    }
+
+    #[test]
+    fn fofn_expansion_rejects_empty_fofn() {
+        let dir = create_partition_dir().unwrap();
+        let fofn = dir.join("empty.fofn");
+        fs::write(&fofn, b"\n# no inputs\n").unwrap();
+
+        let err = expand_fofns(&[fofn]).unwrap_err().to_string();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(err.contains("no inputs found"));
+    }
+
+    #[test]
+    fn normal_threshold_is_strictly_greater_than_x() {
+        use std::io::Write as _;
+
+        let dir = create_partition_dir().unwrap();
+        let input = dir.join("reads.fa");
+        let mut file = File::create(&input).unwrap();
+        writeln!(file, ">r").unwrap();
+        writeln!(file, "AAAA").unwrap();
+        drop(file);
+
+        let selected = count_inputs(
+            &[input.clone()],
+            CounterConfig {
+                k: 3,
+                minimizer: 2,
+                threshold: 1,
+            },
+        )
+        .unwrap();
+        let filtered = count_inputs(
+            &[input],
+            CounterConfig {
+                k: 3,
+                minimizer: 2,
+                threshold: 2,
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            selected,
+            vec![CountedKmer {
+                encoded: encode(b"AAA"),
+                count: 2,
+            }]
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn non_acgt_bases_split_input_without_crossing_gaps() {
+        use std::io::Write as _;
+
+        let dir = create_partition_dir().unwrap();
+        let input = dir.join("reads.fa");
+        let mut file = File::create(&input).unwrap();
+        writeln!(file, ">r").unwrap();
+        writeln!(file, "AAANAAA").unwrap();
+        drop(file);
+
+        let kmers = count_inputs(
+            &[input],
+            CounterConfig {
+                k: 3,
+                minimizer: 2,
+                threshold: 1,
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            kmers,
+            vec![CountedKmer {
+                encoded: encode(b"AAA"),
+                count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn normal_kmer_fasta_stream_reports_stats_and_counts() {
+        use std::io::Write as _;
+
+        let dir = create_partition_dir().unwrap();
+        let input = dir.join("reads.fa");
+        let output = dir.join("kmers.fa");
+        let mut file = File::create(&input).unwrap();
+        writeln!(file, ">r").unwrap();
+        writeln!(file, "AAAA").unwrap();
+        drop(file);
+
+        let stats = count_inputs_to_kmer_fasta_path_with_stats(
+            &[input],
+            CounterConfig {
+                k: 3,
+                minimizer: 2,
+                threshold: 1,
+            },
+            &output,
+        )
+        .unwrap();
+        let text = fs::read_to_string(&output).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(stats.selected_kmers, 1);
+        assert_eq!(stats.phases.len(), 1);
+        assert_eq!(stats.phases[0].name, "1_index_kmer_counting");
+        assert!(text.contains(">MC_kmer_1 count=2\nAAA\n"));
+    }
+
+    #[test]
+    fn dataset_kmer_fasta_stream_reports_two_phases() {
+        use std::io::Write as _;
+
+        let dir = create_partition_dir().unwrap();
+        let d1 = dir.join("d1.fa");
+        let d2 = dir.join("d2.fa");
+        let output = dir.join("shared.fa");
+        for path in [&d1, &d2] {
+            let mut file = File::create(path).unwrap();
+            writeln!(file, ">d").unwrap();
+            writeln!(file, "AAAA").unwrap();
+        }
+
+        let stats = count_datasets_to_kmer_fasta_path_with_stats(
+            &[d1, d2],
+            CounterConfig {
+                k: 3,
+                minimizer: 2,
+                threshold: 1,
+            },
+            &output,
+        )
+        .unwrap();
+        let text = fs::read_to_string(&output).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(stats.selected_kmers, 1);
+        assert_eq!(stats.phases.len(), 2);
+        assert_eq!(stats.phases[0].name, "1_index_minimizer_presence_counting");
+        assert_eq!(stats.phases[1].name, "2_index_kmer_partition_counting");
+        assert!(text.contains(">MC_kmer_1 count=2\nAAA\n"));
+    }
+
+    #[test]
+    fn readme_documents_public_cli_surface_and_logs() {
+        let readme_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = fs::read_to_string(readme_path).unwrap();
+        let required = [
+            "target/release/MC",
+            "target/release/ZI",
+            "target/release/MCZI",
+            "target/release/R",
+            "--input",
+            "--index",
+            "--index-input",
+            "--query-input",
+            "--fofn",
+            "--index-fofn",
+            "--query-fofn",
+            "--kmer-size",
+            "--minimizer-size",
+            "--threshold",
+            "--format fasta",
+            "--format kff",
+            "--output-suffix",
+            "--output-mode simplitig",
+            "--output-mode regular",
+            "--output-mode no-output",
+            "--reform-output",
+            "--reform-abundance-mode mean|runs",
+            "--abundance-mode mean",
+            "--abundance-mode runs",
+            "--threads",
+            "--ram-limit-gib",
+            "MC_PHASE",
+            "ZI_PHASE",
+            "MCZI_PHASE",
+            "MCZI_STAT",
+            "MCZI_OUTPUT",
+            "R_PHASE",
+            "R_STAT",
+            "wall_seconds",
+            "cpu_seconds",
+            "max_rss_kib",
+            "index_minimizers_above_threshold",
+            "query_kmers_filtered_by_zi",
+            "query_regular_output_nucleotides",
+        ];
+
+        for needle in required {
+            assert!(readme.contains(needle), "README is missing {needle}");
+        }
     }
 }

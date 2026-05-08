@@ -18,6 +18,10 @@ name = "MCZI"
 path = "src/mczi.rs"
 
 [[bin]]
+name = "R"
+path = "src/r.rs"
+
+[[bin]]
 name = "mc-minimizer-scan"
 path = "bench/minimizer_scan.rs"
 
@@ -36,13 +40,18 @@ path = "bench/simulate_reads_from_genome.rs"
 [dependencies]
 ahash = "0.8"
 anyhow = "1"
+bigraph = "=5.0.0"
 clap = { version = "4.5", features = ["derive"] }
 flate2 = { version = "1.1", features = ["zlib-rs"] }
+ggcat-api = { path = "vendor/ggcat/crates/api" }
 helicase = { version = "0.1.1", default-features = false, features = ["packed-seq", "gz", "zstd"] }
+libc = "0.2"
 liblzma = "0.3.6"
+parallel-processor = "=0.1.24"
 rayon = "1.11"
 simd-minimizers = "2.3.1"
 sshash-lib = "0.5.0"
+traitgraph-algo = "=8.1.0"
 zstd = "0.13"
 
 [patch.crates-io]
@@ -52,7 +61,7 @@ simd-minimizers = { path = "vendor/simd-minimizers-2.3.1" }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
 debug = false
 incremental = false

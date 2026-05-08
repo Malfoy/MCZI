@@ -293,4 +293,93 @@ mod tests {
         assert!(text.contains("AATG") || text.contains("CATT"));
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn validate_k_rejects_even_and_out_of_range_values() {
+        assert!(validate_k(3).is_ok());
+        assert!(validate_k(63).is_ok());
+        assert!(validate_k(2).is_err());
+        assert!(validate_k(4).is_err());
+        assert!(validate_k(64).is_err());
+    }
+
+    #[test]
+    fn default_minimizer_size_is_odd_and_below_k() {
+        assert_eq!(default_minimizer_size(3), 1);
+        assert_eq!(default_minimizer_size(5), 3);
+        assert_eq!(default_minimizer_size(31), 19);
+        assert!(default_minimizer_size(31) < 31);
+        assert_eq!(default_minimizer_size(31) % 2, 1);
+    }
+
+    #[test]
+    fn fasta_reader_splits_non_acgt_and_skips_short_chunks() {
+        let dir = create_temp_dir("zi-reader-test").unwrap();
+        let input = dir.join("query.fa");
+        fs::write(&input, b">q\nAAANCCCGNAT\n").unwrap();
+
+        let mut seqs = Vec::new();
+        for_fasta_sequences(&input, 3, |seq| {
+            seqs.push(String::from_utf8(seq.to_vec()).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(seqs, vec!["AAA", "CCCG"]);
+    }
+
+    #[test]
+    fn query_subtraction_deduplicates_absent_canonical_kmers() {
+        let dir = create_temp_dir("zi-dedup-test").unwrap();
+        let index = dir.join("index.fa");
+        let query = dir.join("query.fa");
+        let tmp = dir.join("tmp");
+        fs::create_dir(&tmp).unwrap();
+        fs::write(&index, b">idx\nAAA\n").unwrap();
+        fs::write(&query, b">q1\nCCC\n>q2\nGGG\n>q3\nCCC\n").unwrap();
+
+        let dictionary = build_dictionary(&index, 3, 1, 1, 1, &tmp).unwrap();
+        let novel = collect_query_kmers_absent_from_index(&dictionary, &[query]).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(novel.len(), 1);
+        assert!(novel.contains(&canonical_encoded_kmer(b"CCC")));
+    }
+
+    #[test]
+    fn write_novel_simplitigs_handles_empty_set() {
+        let dir = create_temp_dir("zi-empty-output-test").unwrap();
+        let output = dir.join("out.fa");
+
+        write_novel_simplitigs(&output, 3, AHashSet::new()).unwrap();
+        let text = fs::read_to_string(&output).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn xz_query_input_is_decompressed() {
+        use liblzma::write::XzEncoder;
+        use std::io::Write as _;
+
+        let dir = create_temp_dir("zi-xz-test").unwrap();
+        let index = dir.join("index.fa");
+        let query = dir.join("query.fa.xz");
+        let tmp = dir.join("tmp");
+        fs::create_dir(&tmp).unwrap();
+        fs::write(&index, b">idx\nAAA\n").unwrap();
+        let file = fs::File::create(&query).unwrap();
+        let mut writer = XzEncoder::new(file, 1);
+        writer.write_all(b">q\nCCC\n").unwrap();
+        writer.finish().unwrap();
+
+        let dictionary = build_dictionary(&index, 3, 1, 1, 1, &tmp).unwrap();
+        let novel = collect_query_kmers_absent_from_index(&dictionary, &[query]).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(novel.len(), 1);
+        assert!(novel.contains(&canonical_encoded_kmer(b"CCC")));
+    }
 }
