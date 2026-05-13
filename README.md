@@ -306,17 +306,19 @@ MCZI constraints:
 ## R: Reformer
 
 R takes a unitig FASTA/FASTQ file and a k-mer size, then merges whole unitig records through exact `K-1` overlaps. It never splits an input unitig sequence; a unitig is either used forward or reverse-complemented as one block.
+By default R writes simplitigs with a greedy non-cycling path cover. `--output-mode unitig` writes unitigs by joining only unambiguous `K-1` overlaps.
 
 ```bash
 target/release/R \
   --input unitigs.fa.zst \
   --kmer-size 31 \
   --output reformed_simplitigs.fa.zst \
+  --output-mode simplitig \
   --abundance-mode mean \
   --threads 16
 ```
 
-R stores normalized unitig sequence bytes in a temporary disk-backed store, keeps only record offsets/lengths and oriented `K-1` endpoints in RAM, sorts endpoints in parallel, and greedily selects orientation-compatible non-cycling joins.
+R stores normalized unitig sequence bytes in a temporary disk-backed store by default, keeps record offsets/lengths and oriented `K-1` endpoints in RAM, sorts endpoints in parallel, and greedily selects orientation-compatible non-cycling joins. Output records are always written in the strand that maximizes `A+C`, and sequence lines are not wrapped. An opt-in memory sequence store is available for machines where keeping a 2-bit packed copy in RAM is preferable to the temporary sequence file.
 
 R options:
 
@@ -324,13 +326,48 @@ R options:
 - `--kmer-size`, `-k`: k-mer size used for exact `K-1` overlaps
 - `--output`, `-o`: output FASTA path
 - `--threads`, `-t`: Rayon worker count
+- `--zstd-workers`: zstd output worker count; `0` derives a small worker count from `--threads`
+- `--sequence-store disk`: keep normalized sequence bytes in a temporary disk-backed store; default
+- `--sequence-store memory`: keep normalized sequences in RAM with 2-bit packing
+- `--output-sort none`: keep deterministic path discovery order; default
+- `--output-sort length`: sort output records by decreasing sequence length
+- `--output-sort length-asc`: sort output records by increasing sequence length
+- `--output-sort unitigs`: sort output records by decreasing number of source unitigs
+- `--output-sort unitigs-asc`: sort output records by increasing number of source unitigs
+- `--output-sort sequence-prefix`: sort output records by the first oriented bases
+- `--output-sort sequence-suffix`: sort output records by the last oriented bases
+- `--output-sort prefix-length`: sort output records by first oriented bases, then decreasing length
+- `--output-sort length-bucket-prefix`: sort by coarse length buckets, then first oriented bases
+- `--output-sort length-bucket-prefix-fast`: sort by coarse length buckets, then first oriented bases, using a smaller sort key
+- `--output-sort length-bucket16-prefix`: sort by 16-base length buckets, then first oriented bases
+- `--output-sort length-bucket32-prefix`: sort by 32-base length buckets, then first oriented bases
+- `--output-sort length-bucket128-prefix`: sort by 128-base length buckets, then first oriented bases
+- `--output-sort length-bucket256-prefix`: sort by 256-base length buckets, then first oriented bases
+- `--output-sort length-bucket-prefix-suffix`: sort by coarse length buckets, then first and last oriented bases
+- `--output-sort length-bucket-prefix-ac`: sort by coarse length buckets, first oriented bases, then decreasing `A+C` fraction
+- `--output-sort length-bucket-unitigs-prefix`: sort by coarse length buckets, decreasing number of source unitigs, then first oriented bases
+- `--output-sort length-bucket16-unitigs-prefix`: sort by 16-base length buckets, decreasing number of source unitigs, then first oriented bases
+- `--output-sort length-bucket32-unitigs-prefix`: sort by 32-base length buckets, decreasing number of source unitigs, then first oriented bases
+- `--output-sort length-bucket128-unitigs-prefix`: sort by 128-base length buckets, decreasing number of source unitigs, then first oriented bases
+- `--output-sort length-bucket-unitigs-prefix-suffix`: sort by coarse length buckets, decreasing number of source unitigs, then first and last oriented bases
+- `--output-sort length-unitigs-prefix`: sort by decreasing sequence length, decreasing number of source unitigs, then first oriented bases
+- `--output-sort unitigs-length-prefix`: sort by decreasing number of source unitigs, decreasing sequence length, then first oriented bases
+- `--output-sort ac-richness`: sort output records by decreasing `A+C` fraction
+- `--strand-tiebreak none`: when both strands have the same `A+C` count, keep the forward record orientation; default
+- `--strand-tiebreak prefix`: when both strands have the same `A+C` count, choose the strand with the smaller oriented prefix sort key
+- `--strand-tiebreak prefix-ac`: when both strands have the same `A+C` count, choose the strand with more `A+C` in the first oriented bases
+- `--output-mode simplitig`: greedily cover compatible overlaps and write FASTA records named `A`; default
+- `--output-mode unitig`: only join unambiguous compatible overlaps and write FASTA records named `A`
 - `--abundance-mode mean`: write weighted mean `km:f` abundance per output simplitig
 - `--abundance-mode runs`: write run-length encoded per-k-mer `km:f` abundance
+- `--no-abundance`: do not require input `km:f` headers and do not emit output `km:f` headers
 
-R expects each input unitig header to contain `km:f:<value>` when run from the CLI. The abundance can be emitted in two forms:
+Unless `--no-abundance` is set, R expects each input unitig header to contain `km:f:<value>` or `ka:f:<value>` when run from the CLI. The abundance can be emitted in two forms:
 
-- `--abundance-mode mean` is the default. It writes one `km:f:<value>` per output simplitig, where the value is the mean abundance weighted by the number of k-mers contributed by each merged input unitig.
-- `--abundance-mode runs` writes run-length encoded per-k-mer abundance as `km:f:<value>:<count>:...`, reverses run order when a unitig is reverse-complemented, and coalesces adjacent equal-value runs.
+- `--abundance-mode mean` is the default. It writes one rounded integer `km:f:<value>` per output record, where the value is the mean abundance weighted by the number of k-mers contributed by each merged input unitig.
+- `--abundance-mode runs` writes rounded integer run-length encoded per-k-mer abundance as `km:f:<value>:<count>:...`, reverses run order when a unitig is reverse-complemented, and coalesces adjacent equal-value runs after rounding.
+
+Every R output header uses the fixed FASTA name `A` and, when abundance is enabled, the `km:f` field.
 
 R constraints:
 
@@ -432,7 +469,8 @@ R currently reports:
 - `input_unitigs`
 - `input_bases`
 - `selected_overlaps`
-- `output_simplitigs`
+- `output_simplitigs` in simplitig mode
+- `output_unitig_records` in unitig mode
 - `output_unitigs`
 - `output_bases`
 

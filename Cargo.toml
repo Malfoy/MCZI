@@ -52,7 +52,7 @@ rayon = "1.11"
 simd-minimizers = "2.3.1"
 sshash-lib = "0.5.0"
 traitgraph-algo = "=8.1.0"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 
 [patch.crates-io]
 simd-minimizers = { path = "vendor/simd-minimizers-2.3.1" }

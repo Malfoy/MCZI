@@ -1301,7 +1301,12 @@ fn reform_output_path(
             input: input_path.to_path_buf(),
             kmer_size: k,
             output: output_path.to_path_buf(),
+            output_mode: reformer::OutputMode::Simplitig,
+            sequence_store_mode: reformer::SequenceStoreMode::Disk,
+            output_sort: reformer::OutputSort::None,
+            strand_tiebreak: reformer::OutputStrandTieBreak::None,
             abundance_mode,
+            zstd_workers: None,
             emit_logs: false,
         },
         tmp_dir,
@@ -1944,7 +1949,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
 
         assert!(text.contains("AAAACGTTT"));
-        assert!(text.contains("km:f:3.285714"));
+        assert!(text.contains(">A km:f:3"));
     }
 
     #[test]
@@ -1970,7 +1975,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
 
         assert!(text.contains("AAAACGTTT"));
-        assert!(text.contains("km:f:2.0:1:3.0:4:4.0:2"));
+        assert!(text.contains(">A km:f:2:1:3:4:4:2"));
     }
 
     #[test]

@@ -1353,6 +1353,13 @@ impl Write for OutputWriter {
 }
 
 pub fn create_output_writer(output_path: &Path) -> Result<OutputWriter> {
+    create_output_writer_with_zstd_workers(output_path, None)
+}
+
+pub fn create_output_writer_with_zstd_workers(
+    output_path: &Path,
+    zstd_workers: Option<u32>,
+) -> Result<OutputWriter> {
     let file = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
     let writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
@@ -1362,7 +1369,11 @@ pub fn create_output_writer(output_path: &Path) -> Result<OutputWriter> {
         }
         Some(OutputCompression::Xz) => OutputWriterInner::Xz(XzEncoder::new(writer, 6)),
         Some(OutputCompression::Zstd) => {
-            OutputWriterInner::Zstd(zstd::stream::write::Encoder::new(writer, 0)?)
+            let mut encoder = zstd::stream::write::Encoder::new(writer, 1)?;
+            if let Some(workers) = zstd_workers.filter(|&workers| workers > 0) {
+                encoder.multithread(workers)?;
+            }
+            OutputWriterInner::Zstd(encoder)
         }
         None => OutputWriterInner::Plain(writer),
     };
@@ -6197,10 +6208,12 @@ mod tests {
             "--output-mode simplitig",
             "--output-mode regular",
             "--output-mode no-output",
+            "--output-mode unitig",
             "--reform-output",
             "--reform-abundance-mode mean|runs",
             "--abundance-mode mean",
             "--abundance-mode runs",
+            "--no-abundance",
             "--threads",
             "--partition-count",
             "--ram-limit-gib",
@@ -6216,6 +6229,7 @@ mod tests {
             "index_minimizers_above_threshold",
             "query_kmers_filtered_by_zi",
             "query_regular_output_nucleotides",
+            "output_unitig_records",
         ];
 
         for needle in required {
